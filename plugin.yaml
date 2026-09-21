@@ -1,0 +1,38 @@
+name: hermes-artifactbridge
+version: 0.1.0.dev0
+kind: standalone
+description: >
+  ArtifactBridge delegation plugin. During an ArtifactBridge A2A delegation the
+  agent gets delegation-scoped ArtifactBridge tools (read the brief and Room,
+  read/list/search documents in scope, contribute, upload images, create
+  documents, propose changes). Each call forwards the delegation token from the
+  task brief together with the runtime's service credential to the configured
+  ArtifactBridge endpoint only. No personal ArtifactBridge login; contributions
+  are attributed to the shared service.
+author: Omnim
+# Both are shown once at ArtifactBridge enrollment (Settings > Agent Sharing).
+requires_env:
+  - ARTIFACTBRIDGE_SERVICE_CREDENTIAL
+  - ARTIFACTBRIDGE_TOOLS_URL
+provides_tools:
+  - artifactbridge_delegation_read_brief
+  - artifactbridge_delegation_read_room
+  - artifactbridge_delegation_read_document
+  - artifactbridge_delegation_list_documents
+  - artifactbridge_delegation_search_documents
+  - artifactbridge_delegation_contribute
+  - artifactbridge_delegation_upload_image
+  - artifactbridge_delegation_create_document
+  - artifactbridge_delegation_propose_change
+# No Hermes hooks: the token rides in the task text and the tools are static.
+provides_hooks: []
+# pyproject.toml beside this manifest is what Hermes installs (it wins over this list); kept in sync.
+python_dependencies:
+  - "mcp>=2.0,<3"
+  - "httpx2>=2.7,<3"
+manifest_version: 2
+license: MIT
+homepage: https://github.com/omnim-ai/hermes-artifactbridge
+tags: [artifactbridge, a2a, delegation]
+# Load gate only: exercised against a 0.21.3 source checkout; no released-version validation is claimed.
+requires_hermes: ">=0.21.3"

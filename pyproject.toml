@@ -1,0 +1,39 @@
+[project]
+name = "hermes-artifactbridge"
+version = "0.1.0.dev0"
+description = "ArtifactBridge delegation plugin for Hermes Agent: scoped AB tools during A2A delegations, no personal AB login."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+# Installed into Hermes' venv under Hermes' own pins (hermes plugins install/enable); ranges, not exact pins,
+# so a core-pin move on `hermes update` does not disable the plugin. Exercised with mcp 2.0.0 / httpx2 2.7.0.
+dependencies = [
+    "mcp>=2.0,<3",
+    "httpx2>=2.7,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/omnim-ai/hermes-artifactbridge"
+
+[project.entry-points."hermes_agent.plugins"]
+hermes-artifactbridge = "hermes_artifactbridge"
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.3.0",
+    "starlette==1.3.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hermes_artifactbridge"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"
