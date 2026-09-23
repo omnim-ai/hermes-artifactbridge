@@ -10,10 +10,9 @@ description: >
   ArtifactBridge endpoint only. No personal ArtifactBridge login; contributions
   are attributed to the shared service.
 author: Omnim
-# Both are shown once at ArtifactBridge enrollment (Settings > Agent Sharing).
+# Credential shown once at enrollment (Settings > Agent Sharing); tools URL defaults to production.
 requires_env:
   - ARTIFACTBRIDGE_SERVICE_CREDENTIAL
-  - ARTIFACTBRIDGE_TOOLS_URL
 provides_tools:
   - artifactbridge_delegation_read_brief
   - artifactbridge_delegation_read_room

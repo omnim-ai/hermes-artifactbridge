@@ -1,6 +1,6 @@
 """The one ArtifactBridge endpoint this runtime talks to.
 
-The tools URL comes from configuration only (shown at enrollment), never from
+The tools URL comes from the production default or operator configuration, never from
 task text. Trust rule (the one ArtifactBridge applies to runtime endpoints, see
 THIRD_PARTY.md): https anywhere, http only on loopback, no userinfo, no fragment. The renewal URL is derived from that same origin.
 """

@@ -47,11 +47,10 @@ runs only the self-contained tests below.
    This proof of concept does not exclude personal tools per execution; keeping
    them out of the serving profile is the operator's precondition.
 2. **Enrol the Hermes agent as a service in ArtifactBridge** (Settings > Agent
-   Sharing). Enrollment shows two values once:
+   Sharing). Save the service credential in the serving profile's environment:
 
    ```
    ARTIFACTBRIDGE_SERVICE_CREDENTIAL=agw_...          # runtime-only; never in chat or logs
-   ARTIFACTBRIDGE_TOOLS_URL=https://app.artifactbridge.com/mcp/agent-gateway
    ```
 
    The **service credential** is held by the runtime only: it never enters
@@ -62,12 +61,15 @@ runs only the self-contained tests below.
    requires the enrolled service's credential and checks delegation state,
    generation and scope), but anyone holding both can use that delegation's
    scope until it is revoked, expires or the delegation moves on.
-3. **Trusted URL only.** The tools URL must be https (plain `http://` only for
+3. **Production URL by default.** When `ARTIFACTBRIDGE_TOOLS_URL` is unset, the
+   plugin uses `https://app.artifactbridge.com/mcp/agent-gateway`. Set it explicitly
+   for a different deployment. The override must be https (plain `http://` only for
    `127.0.0.1`, `localhost` and `::1`, for self-hosted development), without
    userinfo or fragment. The token is only ever sent to this origin; redirects
-   are never followed; any URL found in task text is ignored. With a missing or
-   untrusted URL the tools are registered but hidden by Hermes' `requires_env`
-   gate, and a call refuses with `not_configured`.
+   are never followed; any URL found in task text is ignored. An explicit empty
+   or untrusted override hides the tools through `check_fn`; a direct call
+   refuses with `not_configured` and never falls back to production. The service
+   credential remains required through Hermes' `requires_env` gate.
 4. **Expose the agent over A2A** with Hermes' bundled A2A platform, and set
    `A2A_REPLY_TIMEOUT` for the longest delegation you intend to serve (see
    Known limitations). The plugin never changes this setting.
@@ -87,7 +89,7 @@ this repository:
 ```
 hermes plugins install omnim-ai/hermes-artifactbridge --ref <40-character commit SHA> --no-enable
 hermes plugins list
-hermes plugins enable hermes-artifactbridge     # prompts for the two env vars, saves them to .env
+hermes plugins enable hermes-artifactbridge     # prompts for the service credential, saves it to .env
 hermes plugins doctor hermes-artifactbridge --ci
 ```
 
@@ -100,12 +102,27 @@ discovered the same way (`hermes plugins list`, then `enable`).
   Exercised with mcp 2.0.0 and httpx2 2.7.0. `--no-deps` skips this.
 - **Version gate.** `requires_hermes: ">=0.21.3"` is a load gate only: that is
   the version this plugin was exercised against, not a validated release.
-- **Update.** A `--ref` install is pinned; `hermes plugins update` refuses to
-  move it. Move the pin with
+- **Update.** For an existing unpinned install, run
+  `hermes plugins update hermes-artifactbridge`. If disabled, also run
+  `hermes plugins enable hermes-artifactbridge`. A `--ref` install is pinned;
+  `hermes plugins update` refuses to move it. Move the pin with
   `hermes plugins install <source> --force --ref <new 40-character SHA>`.
 - **Uninstall.** `hermes plugins remove hermes-artifactbridge` (alias
   `uninstall`) deletes the install tree. The plugin writes nothing under
-  `HERMES_HOME` of its own; the two env vars stay in `.env` until you remove them.
+  `HERMES_HOME` of its own; any saved env vars stay in `.env` until you remove them.
+
+## Troubleshooting
+
+- **Already installed.** Hermes' installer refuses an existing install before
+  this plugin runs, so the plugin cannot prevent that error. Use
+  `hermes plugins update hermes-artifactbridge` for an unpinned install instead
+  of installing again, then `hermes plugins enable hermes-artifactbridge` if
+  disabled. For a pinned install, use the explicit `--force --ref` command above.
+- **Tools hidden or `not_configured`.** Check that the service credential is
+  set. If `ARTIFACTBRIDGE_TOOLS_URL` is present but empty or invalid, remove the
+  variable to use production, or replace it with a trusted deployment URL.
+  An empty override does not mean “use the default.” Restart the serving Hermes
+  process after changing its environment.
 
 ## Known limitations
 

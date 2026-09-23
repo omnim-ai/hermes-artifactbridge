@@ -17,6 +17,7 @@ from .tools import ScopedTools
 
 SERVICE_CREDENTIAL_ENV = "ARTIFACTBRIDGE_SERVICE_CREDENTIAL"
 TOOLS_URL_ENV = "ARTIFACTBRIDGE_TOOLS_URL"
+DEFAULT_TOOLS_URL = "https://app.artifactbridge.com/mcp/agent-gateway"
 SKILL_PATH = Path(__file__).resolve().parent.parent / "skills" / "artifactbridge-delegation" / "SKILL.md"
 
 PLUGIN: ScopedTools | None = None
@@ -29,8 +30,13 @@ def _service_credential() -> str:
     return value
 
 
+def _tools_url() -> str:
+    """Default only when unset; an explicit empty or invalid override must fail closed."""
+    return os.environ.get(TOOLS_URL_ENV, DEFAULT_TOOLS_URL)
+
+
 def _configured() -> bool:
-    return bool(os.environ.get(SERVICE_CREDENTIAL_ENV)) and is_trusted_url(os.environ.get(TOOLS_URL_ENV, ""))
+    return bool(os.environ.get(SERVICE_CREDENTIAL_ENV)) and is_trusted_url(_tools_url())
 
 
 def build_plugin(*, tools_url: str, **kwargs) -> ScopedTools:
@@ -47,10 +53,10 @@ def _unconfigured_handler(name: str):
 
 def register(ctx) -> None:
     """Register the nine static tools unconditionally (the stock ``requires_env``/``check_fn`` gate hides
-    them until both variables are set) and the skill. With an untrusted or missing tools URL the
+    them until a credential and trusted tools URL are available) and the skill. With an untrusted override the
     handlers refuse with ``not_configured`` and no client is built."""
     global PLUGIN
-    tools_url = os.environ.get(TOOLS_URL_ENV, "")
+    tools_url = _tools_url()
     PLUGIN = build_plugin(tools_url=tools_url) if is_trusted_url(tools_url) else None
     for schema in TOOL_SCHEMAS:
         name = schema["name"]
@@ -58,7 +64,7 @@ def register(ctx) -> None:
             name=name, toolset=TOOLSET, schema=schema,
             handler=PLUGIN.handler_for(name) if PLUGIN else _unconfigured_handler(name),
             is_async=True, description=schema["description"], check_fn=_configured,
-            requires_env=[SERVICE_CREDENTIAL_ENV, TOOLS_URL_ENV],
+            requires_env=[SERVICE_CREDENTIAL_ENV],
         )
     ctx.register_skill("delegation", SKILL_PATH,
                        description="How to execute an ArtifactBridge delegation with the scoped tools.")
