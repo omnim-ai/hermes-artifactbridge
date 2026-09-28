@@ -53,6 +53,12 @@ runs only the self-contained tests below.
    ARTIFACTBRIDGE_SERVICE_CREDENTIAL=agw_...          # runtime-only; never in chat or logs
    ```
 
+   Put it in the serving profile's own `.env` (`<HERMES_HOME>/profiles/<name>/.env`).
+   Under a multiplexed gateway (one Hermes process serving several profiles) the
+   plugin reads the credential and `ARTIFACTBRIDGE_TOOLS_URL` from that profile's
+   secret scope for each turn, never from the default profile's environment; a
+   profile without its own credential shows the tools as not configured.
+
    The **service credential** is held by the runtime only: it never enters
    tool arguments, results, logs or exceptions. The **delegation token**
    (`dlt_...`) is different: ArtifactBridge puts it in the task text of each

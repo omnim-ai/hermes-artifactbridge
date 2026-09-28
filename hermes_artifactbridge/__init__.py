@@ -23,8 +23,26 @@ SKILL_PATH = Path(__file__).resolve().parent.parent / "skills" / "artifactbridge
 PLUGIN: ScopedTools | None = None
 
 
+def _env(name: str, default: str | None = None) -> str | None:
+    """Read a setting from the ACTIVE Hermes profile.
+
+    Under a multiplexed gateway (one process serving several profiles) ``os.environ`` holds the
+    default profile's ``.env``, not the serving profile's. Hermes' ``get_secret`` resolves the
+    per-turn profile scope; outside a scope it fails closed while multiplexing, which reads as
+    "not configured" here. Plain ``os.environ`` remains the fallback for Hermes builds without it.
+    """
+    try:
+        from agent.secret_scope import get_secret
+    except ImportError:
+        return os.environ.get(name, default)
+    try:
+        return get_secret(name, default)
+    except Exception:  # UnscopedSecretError: no profile scope while multiplexing -> fail closed
+        return None
+
+
 def _service_credential() -> str:
-    value = os.environ.get(SERVICE_CREDENTIAL_ENV, "")
+    value = _env(SERVICE_CREDENTIAL_ENV, "") or ""
     if not value:
         raise RuntimeError(f"{SERVICE_CREDENTIAL_ENV} is not set")
     return value
@@ -32,11 +50,12 @@ def _service_credential() -> str:
 
 def _tools_url() -> str:
     """Default only when unset; an explicit empty or invalid override must fail closed."""
-    return os.environ.get(TOOLS_URL_ENV, DEFAULT_TOOLS_URL)
+    value = _env(TOOLS_URL_ENV, DEFAULT_TOOLS_URL)
+    return DEFAULT_TOOLS_URL if value is None else value
 
 
 def _configured() -> bool:
-    return bool(os.environ.get(SERVICE_CREDENTIAL_ENV)) and is_trusted_url(_tools_url())
+    return bool(_env(SERVICE_CREDENTIAL_ENV)) and is_trusted_url(_tools_url())
 
 
 def build_plugin(*, tools_url: str, **kwargs) -> ScopedTools:
