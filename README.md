@@ -11,8 +11,9 @@ shared service; the final A2A answer is the one Room result.
 Status: proof of concept, not released. Tested with Hermes Agent 0.21.3 (a
 source checkout at that version), mcp 2.0.0 and httpx2 2.7.0, against a pinned
 ArtifactBridge backend on a loopback journey (dispatch, input-required resume,
-cancel, reply timeout). No other Hermes version has been tested. The public CI
-runs only the self-contained tests below.
+cancel, reply timeout). HTML support also passes plugin doctor/validate on
+Hermes 0.21.5+4533.g39faafb; no A2A journey was run on that version. The public
+CI runs only the self-contained tests below.
 
 ## What it does
 
@@ -21,8 +22,9 @@ runs only the self-contained tests below.
   `_read_room`, `_read_document`, `_list_documents`, `_search_documents`,
   `_contribute`, `_upload_image`, `_create_document`, `_propose_change`.
   Every tool requires `delegation_token` (`dlt_` + 43 base64url characters).
-  `delegation_id` and `room_id` are never model arguments: the token binds the
-  delegation and ArtifactBridge defaults the Room from it.
+  `delegation_id` is never a model argument. Only `create_document` accepts
+  `room_id`, to opt into an HTML Room artifact. The backend checks that it is
+  the delegation's Room; the plugin strips `room_id` from all other tools.
 - Sends each call as one short-lived streamable-HTTP MCP request to exactly the
   configured tools URL with `Authorization: Bearer <service credential>` and
   `X-ArtifactBridge-Delegation-Token: <token>`. No process-wide header, no
@@ -39,6 +41,85 @@ runs only the self-contained tests below.
   repeated operations stay distinct.
 - Ships the namespaced skill `hermes-artifactbridge:delegation`.
 - Registers no Hermes hooks and patches nothing in Hermes.
+
+## HTML Room artifacts and Claude Code handoff
+
+`artifactbridge_delegation_create_document` accepts:
+
+- `title` and `content_md` (required). Despite its name, `content_md` carries
+  the complete HTML source when `format` is `html`.
+- `format`: `markdown` (default) or `html`.
+- `room_id`: the Room UUID returned by `read_brief`. With `format: "html"`,
+  this creates unfiled Room context and attaches its exact version. Omit it
+  for a Library document in the authorized destination folder, for either format.
+- `idempotency_key`: a stable key for this one logical write. Keep the key and
+  payload unchanged when retrying; use a new key for an intentional new artifact.
+
+HTML may contain at most 10,000,000 UTF-8 bytes. Markdown retains its
+200,000-character limit. HTML must be nonempty, well-formed UTF-8 text without
+NUL bytes. The plugin preserves content as supplied, including CRLF, Unicode,
+inline styles and scripts. It does not sanitize, trim, wrap or normalize HTML.
+
+The schema follows the backend's flat schema: content limits are described,
+not expressed as one `maxLength` or provider-specific conditional schemas.
+`maxLength` cannot enforce a UTF-8 byte cap. The backend applies format-specific
+validation and same-Room authorization; errors such as `validation_error`,
+`room_out_of_scope` and `destination_not_allowed` pass through unchanged.
+An invalid request is never retried as Markdown or as a Library document.
+
+### Claude writes; Hermes publishes
+
+1. Hermes reads the delegation brief with the scoped plugin. Keep the token in
+   Hermes; do not put it in Claude's prompt or generated file.
+2. Ask Claude Code to create one self-contained UTF-8 HTML file, with inline
+   CSS/JS/assets, and return its absolute path. The path must be accessible to
+   Hermes, not only inside Claude's container or remote machine. Arrange an
+   authorized file transfer first if they do not share a filesystem.
+3. Hermes reads the exact file contents. For a byte-preserving Python read,
+   use `Path(path).read_bytes().decode("utf-8")`; the default text-mode read
+   can translate CRLF. Check `len(raw_bytes) <= 10_000_000`. Do not publish
+   line-number prefixes, truncated tool output, a filename, or Markdown fences.
+4. Hermes calls `artifactbridge_delegation_create_document` with that content,
+   `format: "html"`, the brief's `room_id`, its `delegation_token`, and a stable
+   `idempotency_key` such as `design-first-draft`. The plugin supplies the
+   serving profile's service credential. Claude Code does not implicitly
+   inherit Hermes tools, profile scope or credentials. No personal login is needed.
+5. Inspect the receipt. Return the document/version IDs and Room attachment
+   status in the final A2A answer. Read back the document and Room with scoped
+   tools before claiming delivery. Creating an artifact does not complete A2A.
+
+A receipt can contain `room_attach_failed` even though the document was created.
+Preserve and report its document/version IDs and failure details. A same-key
+retry replays that receipt; it does not repair the attachment. This plugin has
+no scoped attach-repair tool. Do not follow the receipt's member-tool retry
+hint through personal credentials, or create another document to hide the failure.
+
+### Large-file handoff remains a separate design choice
+
+This release accepts inline content only; it adds no `content_path` argument,
+file reader, subprocess bridge or new tool. Schema support does not make a
+multi-megabyte file practical to send through a model's context/output window.
+Hermes' documented `execute_code` tool bridge exposes a fixed built-in tool
+allowlist, not arbitrary plugin tools. Do not assume it can call this plugin
+or recover profile credentials in a child process.
+
+For small files, use a complete, untruncated read and an inline scoped call.
+For multi-megabyte files, stop if the available runtime cannot transfer the
+exact contents to the plugin without model transcription. A future path-based
+helper needs an explicit design decision: host versus sandbox path resolution,
+authorized roots, symlink handling, strict UTF-8 reads, byte limits, and dispatch
+under the active profile's scope. Do not work around this by exposing credentials
+to Claude, importing the plugin in a shell, or using personal MCP access.
+
+The transport tests cover a 10,000,000-byte body against an in-process fake.
+They do not prove a Claude-to-Hermes multi-megabyte handoff or deployed Worker
+capacity. Large escaped HTML can still exceed backend Worker memory; this
+plugin change does not resolve that acceptance risk.
+
+Contract: [merged backend PR #3504](https://github.com/omnim-ai/artifact-bridge/pull/3504)
+(commit `cf9c3fda86cc1cda08e0d620888cc23ecbe1b078`). Hermes references:
+[code execution](https://hermes-agent.nousresearch.com/docs/user-guide/features/code-execution)
+and [plugin tools](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins).
 
 ## Operator setup
 
@@ -167,7 +248,16 @@ uv sync --group dev
 
 The suite runs against an in-process fake ArtifactBridge
 (`tests/fake_ab.py`) that reproduces the service-bearer-plus-token boundary,
-its denial codes and the renewal route.
+its denial codes and the renewal route. Registered-tool HTML tests exercise
+schema admission, exact file-to-MCP content, authority stripping, backend error
+and receipt passthrough, and safe retry behavior. Their scripted backend replies
+do not independently verify backend authorization, byte validation or SQL
+idempotency. Local checks used Python 3.14.7, mcp 2.2.0 and httpx2 2.13.1.
+
+`skills-ref validate skills/artifactbridge-delegation` reports a pre-existing
+name/directory mismatch (`delegation` versus `artifactbridge-delegation`). The
+skill metadata is preserved because Hermes registers it as
+`hermes-artifactbridge:delegation`; plugin doctor and validate accept it.
 
 The plugin was also exercised end to end against ArtifactBridge's own backend
 and a stock Hermes gateway on a loopback journey (dispatch to completion, an
