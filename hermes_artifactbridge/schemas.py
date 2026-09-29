@@ -3,8 +3,9 @@
 Tool names and argument bounds are the ArtifactBridge scoped-tool interface (protocol
 facts, see THIRD_PARTY.md); descriptions are this plugin's own wording. Every tool takes
 the opaque ``delegation_token`` from the task brief; the plugin moves it into a
-request header. ``delegation_id`` and ``room_id`` are not model arguments: the
-token binds the delegation and ArtifactBridge defaults the Room from it.
+request header. ``delegation_id`` is never a model argument. Only document
+creation exposes ``room_id`` to opt into an HTML Room artifact; the backend
+checks that it is the token's Room.
 Schemas are constants: no per-task registration, stable across turns.
 """
 from __future__ import annotations
@@ -64,9 +65,19 @@ TOOL_SCHEMAS: tuple[dict, ...] = (
             {"content_type": {"type": "string", "minLength": 1}, "data_base64": {"type": "string", "minLength": 1}},
             ["content_type", "data_base64"]),
     _schema("artifactbridge_delegation_create_document",
-            "Write a new document into the destination folder this delegation is allowed to create in.",
+            "Create Markdown or HTML in the authorized destination folder, or pass format html and room_id "
+            "to create and attach an unfiled artifact to this delegation's Room. "
+            "Omitting room_id creates a Library document; it does not default to the Room.",
             {"title": {"type": "string", "minLength": 1, "maxLength": 200},
-             "content_md": {"type": "string", "maxLength": 200000}}, ["title", "content_md"], write=True),
+             # Match the backend's flat schema. JSON Schema maxLength counts characters, not UTF-8 bytes;
+             # format-dependent body limits and Room validation remain authoritative on the backend.
+             "content_md": {"type": "string", "description":
+                            "Markdown (at most 200,000 characters) or complete HTML (at most 10,000,000 UTF-8 bytes). "
+                            "Pass HTML verbatim, not a file path, Markdown fence, or summary."},
+             "format": {"type": "string", "enum": ["markdown", "html"], "default": "markdown"},
+             "room_id": {"type": "string", "description":
+                         "Only with format html: the Room UUID from read_brief. Creates unfiled Room context. "
+                         "Other Rooms are refused. Omit for a Library document."}}, ["title", "content_md"], write=True),
     _schema("artifactbridge_delegation_propose_change",
             "Submit a whole-document proposal for one of the documents this delegation may propose changes to. "
             "Humans review it; the service can never approve its own proposal.",
@@ -76,5 +87,7 @@ TOOL_SCHEMAS: tuple[dict, ...] = (
 
 TOOL_NAMES: tuple[str, ...] = tuple(s["name"] for s in TOOL_SCHEMAS)
 
-# Authority-bearing arguments the model must never supply; stripped before dispatch.
+# Authority selectors stripped before dispatch, except room_id on create_document.
+# That explicit opt-in selects Room context rather than a Library document;
+# the backend still enforces same-Room scope.
 RESERVED_ARGS = frozenset({"delegation_id", "room_id"})

@@ -56,7 +56,10 @@ class ScopedTools:
             return refusal("missing_delegation_token")
         if not isinstance(token, str) or not TOKEN_RE.match(token):
             return refusal("invalid_delegation_token")
-        payload = {k: v for k, v in args.items() if k not in RESERVED_ARGS}
+        # room_id opts into a Room artifact only here. Never default, normalize, or
+        # drop it based on format: the backend must reject invalid/out-of-scope requests.
+        reserved = RESERVED_ARGS - {"room_id"} if name == "artifactbridge_delegation_create_document" else RESERVED_ARGS
+        payload = {k: v for k, v in args.items() if k not in reserved}
         headers = scoped_headers(self._service_credential(), token)
 
         result = await self._call(name, payload, headers)
