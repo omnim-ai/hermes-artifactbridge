@@ -71,7 +71,7 @@ def _unconfigured_handler(name: str):
 
 
 def register(ctx) -> None:
-    """Register the nine static tools unconditionally (the stock ``requires_env``/``check_fn`` gate hides
+    """Register the eleven static tools unconditionally (the stock ``requires_env``/``check_fn`` gate hides
     them until a credential and trusted tools URL are available) and the skill. With an untrusted override the
     handlers refuse with ``not_configured`` and no client is built."""
     global PLUGIN

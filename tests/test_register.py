@@ -10,17 +10,7 @@ import hermes_artifactbridge as plugin_module
 from hermes_artifactbridge import SKILL_PATH, register
 from hermes_artifactbridge.schemas import RESERVED_ARGS, TOKEN_ARG, TOOL_NAMES, TOOL_SCHEMAS, TOOLSET
 from tests import fake_ab
-
-
-class FakeCtx:
-    def __init__(self):
-        self.tools, self.skills = [], []
-
-    def register_tool(self, **kwargs):
-        self.tools.append(kwargs)
-
-    def register_skill(self, name, path, description=""):
-        self.skills.append((name, path, description))
+from tests.conftest import FakeCtx
 
 
 @pytest.mark.parametrize("tools_url", ["", " ", "not-a-url", "http://app.artifactbridge.com/mcp/agent-gateway",
@@ -55,6 +45,7 @@ def test_register_static_tools_and_namespaced_skill(monkeypatch, tools_url):
     assert plugin_module.PLUGIN is not None
     assert plugin_module.PLUGIN.tools_url == expected_url
     assert [t["name"] for t in ctx.tools] == list(TOOL_NAMES)
+    assert len(TOOL_NAMES) == 11 and {READ_SPACE_CONTEXT, READ_SKILL} <= set(TOOL_NAMES)
     for tool in ctx.tools:
         assert tool["toolset"] == TOOLSET and tool["is_async"] is True
         assert tool["check_fn"]() is True
@@ -105,15 +96,60 @@ def test_manifest_matches_registered_tools_and_required_environment(monkeypatch)
     assert block_list("provides_tools") == [tool["name"] for tool in ctx.tools]
 
 
+READ_SPACE_CONTEXT = "artifactbridge_read_space_context"
+READ_SKILL = "artifactbridge_read_skill"
+# Hosted proxy schemas frozen by the AI-3948 plugin tool contract, minus the "$schema"/"title" document metadata.
+CONTRACT_PROXY_SCHEMAS = {
+    READ_SPACE_CONTEXT: {
+        "type": "object",
+        "properties": {
+            "delegation_token": {"type": "string", "minLength": 1},
+            "delegation_id": {"type": "string"},
+            "space_id": {"type": "string", "format": "uuid"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+            "cursor": {"type": "string", "minLength": 1},
+            "include_archived": {"type": "boolean", "default": False},
+        },
+        "required": ["delegation_token"],
+    },
+    READ_SKILL: {
+        "type": "object",
+        "properties": {
+            "delegation_token": {"type": "string", "minLength": 1},
+            "delegation_id": {"type": "string"},
+            "slug": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
+            "version_policy": {"type": "string", "enum": ["registered", "current"], "default": "registered"},
+        },
+        "required": ["delegation_token", "slug"],
+    },
+}
+LEGACY_TOOL_NAMES = [name for name in TOOL_NAMES if name not in CONTRACT_PROXY_SCHEMAS]
+
+
+def test_space_tools_use_the_contract_proxy_schemas():
+    schemas = {s["name"]: s for s in TOOL_SCHEMAS}
+    assert set(CONTRACT_PROXY_SCHEMAS) <= set(schemas)
+    for name, expected in CONTRACT_PROXY_SCHEMAS.items():
+        Draft202012Validator.check_schema(schemas[name]["parameters"])
+        assert schemas[name]["parameters"] == expected, name
+    validate = Draft202012Validator(schemas[READ_SKILL]["parameters"]).is_valid
+    assert validate({"delegation_token": "t", "slug": "a-b1"})
+    assert not validate({"delegation_token": "", "slug": "a"})
+    assert not validate({"delegation_token": "t", "slug": "Bad"})
+    assert not validate({"delegation_token": "t", "slug": "a", "version_policy": "latest"})
+
+
 def test_schemas_are_static_require_token_and_restrict_authority_selectors():
     before = copy.deepcopy(TOOL_SCHEMAS)
     for schema in TOOL_SCHEMAS:
         params = schema["parameters"]
         assert TOKEN_ARG in params["properties"] and params["required"][0] == TOKEN_ARG, schema["name"]
+        json.dumps(schema)  # provider-serializable
+        if schema["name"] in CONTRACT_PROXY_SCHEMAS:
+            continue  # optional delegation_id selector by contract; pinned above
         reserved = RESERVED_ARGS - {"room_id"} if schema["name"] == "artifactbridge_delegation_create_document" else RESERVED_ARGS
         assert reserved.isdisjoint(params["properties"]), schema["name"]
         assert params["additionalProperties"] is False
-        json.dumps(schema)  # provider-serializable
     assert TOOL_SCHEMAS == before
     with_key = {s["name"] for s in TOOL_SCHEMAS if "idempotency_key" in s["parameters"]["properties"]}
     assert with_key == {"artifactbridge_delegation_contribute", "artifactbridge_delegation_create_document",
@@ -123,19 +159,6 @@ def test_schemas_are_static_require_token_and_restrict_authority_selectors():
 CREATE_DOCUMENT = "artifactbridge_delegation_create_document"
 ROOM = "10000000-0000-4000-8000-000000000001"
 OTHER_ROOM = "10000000-0000-4000-8000-000000000002"
-
-
-@pytest.fixture
-def registered_tools(monkeypatch, app):
-    """Use the public registration boundary and real MCP serialization, with no network."""
-    monkeypatch.setenv("ARTIFACTBRIDGE_SERVICE_CREDENTIAL", fake_ab.SERVICE_CREDENTIAL)
-    monkeypatch.setenv("ARTIFACTBRIDGE_TOOLS_URL", fake_ab.TOOLS_URL)
-    # build_plugin forwards this transport into ScopedTools; no production-only test seam.
-    build = plugin_module.build_plugin
-    monkeypatch.setattr(plugin_module, "build_plugin", lambda **kw: build(**kw, http_factory=fake_ab.http_factory(app)))
-    ctx = FakeCtx()
-    register(ctx)
-    return {tool["name"]: tool for tool in ctx.tools}
 
 
 @pytest.mark.parametrize("body", [
@@ -172,10 +195,17 @@ async def test_registered_library_create_keeps_room_omitted(registered_tools, ab
     assert ab.tool_calls == [(CREATE_DOCUMENT, {k: v for k, v in args.items() if k != "delegation_token"})]
 
 
-@pytest.mark.parametrize("name", [name for name in TOOL_NAMES if name != CREATE_DOCUMENT])
+@pytest.mark.parametrize("name", [name for name in LEGACY_TOOL_NAMES if name != CREATE_DOCUMENT])
 async def test_registered_other_tools_still_strip_authority(registered_tools, ab, token, name):
     await registered_tools[name]["handler"]({"delegation_token": token, "delegation_id": "forged", "room_id": OTHER_ROOM})
     assert ab.tool_calls == [(name, {})]
+
+
+@pytest.mark.parametrize("name, args", [(READ_SPACE_CONTEXT, {}), (READ_SKILL, {"slug": "brand-voice"})])
+async def test_registered_space_tools_forward_delegation_id_but_strip_room_and_token(registered_tools, ab, token, name, args):
+    await registered_tools[name]["handler"]({"delegation_token": token, "delegation_id": "del-1", "room_id": OTHER_ROOM, **args})
+    assert ab.tool_calls == [(name, {"delegation_id": "del-1", **args})]
+    assert all(r["token"] == token for r in ab.requests)
 
 
 # These replies are backend contract fixtures, not a second implementation of

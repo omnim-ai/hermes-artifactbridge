@@ -16,6 +16,7 @@ from typing import Any, Callable
 import httpx2
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.exceptions import MCPError
 
 TOKEN_HEADER = "x-artifactbridge-delegation-token"
 HttpFactory = Callable[[dict[str, str]], httpx2.AsyncClient]
@@ -90,8 +91,10 @@ def adapt_result(result: Any) -> dict:
 
 async def call_scoped_tool(
     tools_url: str, headers: dict[str, str], name: str, arguments: dict, *,
-    http_factory: HttpFactory = default_http_factory, timeout: float = 300,
+    http_factory: HttpFactory = default_http_factory, timeout: float = 300, preserve: bool = False,
 ) -> dict:
+    """``preserve`` returns AB's MCP result as ``{"content", "isError"}`` unchanged and a JSON-RPC
+    error (e.g. tool not offered) as ``{"error": {"code", "message"}}`` instead of raising."""
     http = http_factory(headers)
     hooks = http.event_hooks
     hooks.setdefault("response", []).append(_raise_on_boundary_denial)
@@ -105,14 +108,20 @@ async def call_scoped_tool(
                     result = await session.call_tool(name, arguments, read_timeout_seconds=timeout)
     except BaseException as exc:  # the mcp transport wraps failures in exception groups
         refused = _find(exc, BoundaryRefused)
-        if refused is None:
+        if refused is not None:
+            return {"error": refused.code, "status": refused.status}
+        rpc_error = _find(exc, MCPError) if preserve else None
+        if rpc_error is None:
             raise
-        return {"error": refused.code, "status": refused.status}
+        return {"error": rpc_error.error.model_dump(mode="json", by_alias=True, exclude_none=True)}
     finally:
         # Over real HTTP the transport leaves one async-generator finalizer scheduled on the loop.
         # Hermes runs tool calls on a persistent loop that only spins during dispatch, so give the
         # finalizer its tick here instead of leaving a pending task behind (seen at interpreter exit).
         await asyncio.sleep(0)
+    if preserve:
+        wire = result.model_dump(mode="json", by_alias=True, exclude_none=True)
+        return {"content": wire.get("content", []), "isError": bool(wire.get("isError", False))}
     return adapt_result(result)
 
 
