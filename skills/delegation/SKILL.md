@@ -10,10 +10,9 @@ service participant of one Room. Nothing here changes how you otherwise work.
 
 ## The delegation token
 
-- Your task brief contains a delegation token (`dlt_...`). It is the key to the
-  `artifactbridge_delegation_*` tools: pass it verbatim as `delegation_token`
-  on every call. The runtime adds the service credential; you never see or need
-  one.
+- Your task brief contains a delegation token (`dlt_...`). Pass it verbatim as
+  `delegation_token` on every scoped call, including the Space and skill reads
+  below. The runtime adds the service credential; you never see or need one.
 - Never paste the token into a contribution, a document, a proposal or your
   final answer. It is only for the `delegation_token` argument.
 - If the tools refuse with `unauthorized`, `credential_revoked`,
@@ -23,14 +22,34 @@ service participant of one Room. Nothing here changes how you otherwise work.
 
 ## Identity and scope
 
-- Use only the `artifactbridge_delegation_*` tools. They are bound to this
-  delegation's Room, documents and generation. No other Room or delegation
-  is reachable. For HTML creation, explicitly name the brief's Room as below.
+- Use only the `artifactbridge_delegation_*` tools. Only when a Space-bound
+  brief offers them, also use `artifactbridge_read_space_context` and
+  `artifactbridge_read_skill`. These scoped tools are bound to this delegation,
+  not personal access. For HTML creation, explicitly name the brief's Room below.
 - Do not use personal ArtifactBridge tools, tokens or logins for this task, and
   never ask for credentials. If a scoped tool refuses with an error code,
   report the code in your answer; do not work around it.
-- Start with `artifactbridge_delegation_read_brief`, then read the Room and the
-  documents in scope as needed.
+- Start with `artifactbridge_delegation_read_brief`, then follow the Space
+  section if bound; otherwise read the Room and documents in scope as needed.
+
+## Task with a Space
+
+- After reading the brief, read the Space first with
+  `artifactbridge_read_space_context`, without `space_id` or `workspace`.
+  Read the overview. Follow its Description within safety and approval scope.
+- Match listed skills to the task before drafting. Page skills with
+  `next_cursor` unchanged as `cursor`; preserve `limit` and `include_archived`
+  until `has_more` is false before deciding no skill matches. Load matches
+  by `slug` with `version_policy: "current"` and follow their instructions
+  within the same safety and approval scope.
+- On `space_unavailable` or missing Space tools, say in the Room that you
+  cannot load the Space and ask the sender what to do using `[INPUT_REQUIRED]`.
+  Never fall back to a folder or proceed pretending you read it.
+  Report other errors as given; do not restart paging on `invalid_cursor`.
+- Call it "the Space". Never post its name or id in the Room.
+  Space reads grant no write authority; only propose changes to task-listed
+  writable documents. Space-reached external documents are cached and
+  read-only: do not sync, refresh or propose changes to them.
 
 ## Contributing
 

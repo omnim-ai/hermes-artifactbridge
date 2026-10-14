@@ -54,6 +54,33 @@ def test_register_static_tools_and_namespaced_skill(monkeypatch, tools_url):
     assert SKILL_PATH.is_file() and SKILL_PATH.read_text().startswith("---\nname: delegation")
 
 
+def test_skill_location_matches_public_name():
+    assert SKILL_PATH.relative_to(SKILL_PATH.parents[2]).as_posix() == "skills/delegation/SKILL.md"
+    assert SKILL_PATH.is_file()
+
+
+def test_skill_space_public_prompt_contract():
+    """These instructions are the model-facing scoped Space protocol."""
+    prompt = " ".join(SKILL_PATH.read_text().split())
+    for instruction in (
+        "on every scoped call",
+        "Only when a Space-bound brief offers them",
+        "`artifactbridge_read_space_context` and `artifactbridge_read_skill`",
+        "After reading the brief, read the Space first",
+        "without `space_id` or `workspace`",
+        "Follow its Description within safety and approval scope",
+        "`next_cursor` unchanged as `cursor`",
+        "preserve `limit` and `include_archived`",
+        "until `has_more` is false before deciding no skill matches",
+        'by `slug` with `version_policy: "current"`',
+        "`space_unavailable` or missing Space tools",
+        "say in the Room that you cannot load the Space and ask the sender",
+        "Never fall back to a folder or proceed pretending you read it",
+        "Never post its name or id in the Room",
+    ):
+        assert instruction in prompt
+
+
 @pytest.mark.parametrize("credential", [None, ""])
 @pytest.mark.parametrize("tools_url", [None, fake_ab.TOOLS_URL])
 async def test_missing_credential_gates_tools_and_refuses_before_network(monkeypatch, credential, tools_url):

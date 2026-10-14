@@ -18,7 +18,7 @@ from .tools import ScopedTools
 SERVICE_CREDENTIAL_ENV = "ARTIFACTBRIDGE_SERVICE_CREDENTIAL"
 TOOLS_URL_ENV = "ARTIFACTBRIDGE_TOOLS_URL"
 DEFAULT_TOOLS_URL = "https://app.artifactbridge.com/mcp/agent-gateway"
-SKILL_PATH = Path(__file__).resolve().parent.parent / "skills" / "artifactbridge-delegation" / "SKILL.md"
+SKILL_PATH = Path(__file__).resolve().parent.parent / "skills" / "delegation" / "SKILL.md"
 
 PLUGIN: ScopedTools | None = None
 

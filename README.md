@@ -270,10 +270,7 @@ refusals as contract fixtures; they prove forwarding, header handling, renewal
 and exact result passthrough, not backend ACL or SQL behavior.
 Local checks used Python 3.14.7, mcp 2.2.0 and httpx2 2.13.1.
 
-`skills-ref validate skills/artifactbridge-delegation` reports a pre-existing
-name/directory mismatch (`delegation` versus `artifactbridge-delegation`). The
-skill metadata is preserved because Hermes registers it as
-`hermes-artifactbridge:delegation`; plugin doctor and validate accept it.
+Validate the bundled skill with `skills-ref validate skills/delegation`.
 
 The plugin was also exercised end to end against ArtifactBridge's own backend
 and a stock Hermes gateway on a loopback journey (dispatch to completion, an
