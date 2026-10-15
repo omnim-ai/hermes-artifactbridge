@@ -17,7 +17,7 @@ from typing import Awaitable, Callable
 from .endpoint import renew_url_for
 from .mcp_client import (HttpFactory, call_scoped_tool, default_http_factory, renew_delegation_token,
                          scoped_headers)
-from .schemas import RESERVED_ARGS, TOKEN_ARG, TOOL_NAMES
+from .schemas import RESERVED_ARGS, SPACE_TOOL_NAMES, TOKEN_ARG, TOOL_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +59,14 @@ class ScopedTools:
         # room_id opts into a Room artifact only here. Never default, normalize, or
         # drop it based on format: the backend must reject invalid/out-of-scope requests.
         reserved = RESERVED_ARGS - {"room_id"} if name == "artifactbridge_delegation_create_document" else RESERVED_ARGS
+        # Space tools forward the optional delegation_id selector; the backend refuses any but the token's own.
+        preserve = name in SPACE_TOOL_NAMES
+        if preserve:
+            reserved = reserved - {"delegation_id"}
         payload = {k: v for k, v in args.items() if k not in reserved}
         headers = scoped_headers(self._service_credential(), token)
 
-        result = await self._call(name, payload, headers)
+        result = await self._call(name, payload, headers, preserve)
         if result.get("error") != RENEWABLE_CODE or result.get("status") != 403:
             return result
         # The boundary refused before any tool ran, so one retry after renewal cannot duplicate a write.
@@ -73,11 +77,12 @@ class ScopedTools:
             return refusal("renewal_unavailable")
         if "error" in renewed:
             return renewed
-        return await self._call(name, payload, headers)
+        return await self._call(name, payload, headers, preserve)
 
-    async def _call(self, name: str, payload: dict, headers: dict[str, str]) -> dict:
+    async def _call(self, name: str, payload: dict, headers: dict[str, str], preserve: bool) -> dict:
         try:
-            return await call_scoped_tool(self.tools_url, headers, name, payload, http_factory=self._http_factory)
+            return await call_scoped_tool(self.tools_url, headers, name, payload, http_factory=self._http_factory,
+                                          preserve=preserve)
         except Exception as exc:
             # Outcome unknown for a write: the skill says read back before repeating, same idempotency_key.
             logger.warning("artifactbridge scoped call failed: %s %s", name, type(exc).__name__)

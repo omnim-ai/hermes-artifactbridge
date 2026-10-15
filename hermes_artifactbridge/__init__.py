@@ -18,7 +18,7 @@ from .tools import ScopedTools
 SERVICE_CREDENTIAL_ENV = "ARTIFACTBRIDGE_SERVICE_CREDENTIAL"
 TOOLS_URL_ENV = "ARTIFACTBRIDGE_TOOLS_URL"
 DEFAULT_TOOLS_URL = "https://app.artifactbridge.com/mcp/agent-gateway"
-SKILL_PATH = Path(__file__).resolve().parent.parent / "skills" / "artifactbridge-delegation" / "SKILL.md"
+SKILL_PATH = Path(__file__).resolve().parent.parent / "skills" / "delegation" / "SKILL.md"
 
 PLUGIN: ScopedTools | None = None
 
@@ -71,7 +71,7 @@ def _unconfigured_handler(name: str):
 
 
 def register(ctx) -> None:
-    """Register the nine static tools unconditionally (the stock ``requires_env``/``check_fn`` gate hides
+    """Register the eleven static tools unconditionally (the stock ``requires_env``/``check_fn`` gate hides
     them until a credential and trusted tools URL are available) and the skill. With an untrusted override the
     handlers refuse with ``not_configured`` and no client is built."""
     global PLUGIN

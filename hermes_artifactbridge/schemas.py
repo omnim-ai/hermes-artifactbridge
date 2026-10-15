@@ -3,7 +3,8 @@
 Tool names and argument bounds are the ArtifactBridge scoped-tool interface (protocol
 facts, see THIRD_PARTY.md); descriptions are this plugin's own wording. Every tool takes
 the opaque ``delegation_token`` from the task brief; the plugin moves it into a
-request header. ``delegation_id`` is never a model argument. Only document
+request header. Only the two Space-bound read tools accept ``delegation_id``
+(optional; the backend refuses any delegation but the token's own). Only document
 creation exposes ``room_id`` to opt into an HTML Room artifact; the backend
 checks that it is the token's Room.
 Schemas are constants: no per-task registration, stable across turns.
@@ -37,7 +38,7 @@ def _schema(name: str, description: str, properties: dict, required: list[str], 
     }
 
 
-TOOL_SCHEMAS: tuple[dict, ...] = (
+_DELEGATION_SCHEMAS: tuple[dict, ...] = (
     _schema("artifactbridge_delegation_read_brief",
             "Fetch the delegation you are executing: its task text, scope (Room, documents, folder, allowed actions) and how it is completed.",
             {}, []),
@@ -85,9 +86,40 @@ TOOL_SCHEMAS: tuple[dict, ...] = (
              "summary": {"type": "string", "maxLength": 2000}}, ["document_id", "proposed_md"], write=True),
 )
 
+# Space-bound reads: the hosted proxy schemas of the AI-3948 plugin tool contract, verbatim apart from
+# descriptions. Optional fields carry the server's defaults as documentation; the plugin never inserts them.
+_NONEMPTY_TOKEN_PROPERTY = {"type": "string", "minLength": 1}
+SPACE_TOOL_SCHEMAS: tuple[dict, ...] = (
+    {"name": "artifactbridge_read_space_context",
+     "description": "Read the Space attached to this delegation: its Description, overview, skills and documents, "
+                    "one page per collection. Pass delegation_token from your task brief verbatim. Pass a returned "
+                    "cursor unchanged to read the next page; page through every skill page before deciding no skill "
+                    "matches. space_id and delegation_id default to the delegation's own.",
+     "parameters": {"type": "object", "properties": {
+         TOKEN_ARG: _NONEMPTY_TOKEN_PROPERTY,
+         "delegation_id": {"type": "string"},
+         "space_id": {"type": "string", "format": "uuid"},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+         "cursor": {"type": "string", "minLength": 1},
+         "include_archived": {"type": "boolean", "default": False},
+     }, "required": [TOKEN_ARG]}},
+    {"name": "artifactbridge_read_skill",
+     "description": "Read one skill listed by the delegation's Space, with its modules and provenance. Pass "
+                    "delegation_token from your task brief verbatim. Use version_policy current for a skill the Space "
+                    "lists. Nothing is installed.",
+     "parameters": {"type": "object", "properties": {
+         TOKEN_ARG: _NONEMPTY_TOKEN_PROPERTY,
+         "delegation_id": {"type": "string"},
+         "slug": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
+         "version_policy": {"type": "string", "enum": ["registered", "current"], "default": "registered"},
+     }, "required": [TOKEN_ARG, "slug"]}},
+)
+SPACE_TOOL_NAMES = frozenset(s["name"] for s in SPACE_TOOL_SCHEMAS)
+
+TOOL_SCHEMAS: tuple[dict, ...] = _DELEGATION_SCHEMAS + SPACE_TOOL_SCHEMAS
 TOOL_NAMES: tuple[str, ...] = tuple(s["name"] for s in TOOL_SCHEMAS)
 
-# Authority selectors stripped before dispatch, except room_id on create_document.
-# That explicit opt-in selects Room context rather than a Library document;
-# the backend still enforces same-Room scope.
+# Authority selectors stripped before dispatch, except room_id on create_document and the
+# optional delegation_id on Space tools. room_id there selects Room context rather than a Library
+# document; delegation_id defaults server-side to the token's own delegation and any other is refused.
 RESERVED_ARGS = frozenset({"delegation_id", "room_id"})

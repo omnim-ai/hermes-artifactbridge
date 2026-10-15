@@ -17,14 +17,27 @@ CI runs only the self-contained tests below.
 
 ## What it does
 
-- Registers nine static tools in toolset `artifactbridge-delegation`, mirroring
+- Registers eleven static tools in toolset `artifactbridge-delegation`, mirroring
   ArtifactBridge's scoped surface: `artifactbridge_delegation_read_brief`,
   `_read_room`, `_read_document`, `_list_documents`, `_search_documents`,
-  `_contribute`, `_upload_image`, `_create_document`, `_propose_change`.
+  `_contribute`, `_upload_image`, `_create_document`, `_propose_change`, plus
+  the read-only Space tools `artifactbridge_read_space_context` and
+  `artifactbridge_read_skill`.
   Every tool requires `delegation_token` (`dlt_` + 43 base64url characters).
-  `delegation_id` is never a model argument. Only `create_document` accepts
-  `room_id`, to opt into an HTML Room artifact. The backend checks that it is
-  the delegation's Room; the plugin strips `room_id` from all other tools.
+  Only the two Space tools accept an explicit `delegation_id`; it is optional,
+  defaults server-side to the token's own delegation, and any other is
+  refused. The plugin strips `delegation_id` from the other nine tools. Only
+  `create_document` accepts `room_id`, to opt into an HTML Room artifact. The
+  backend checks that it is the delegation's Room; the plugin strips `room_id`
+  from all other tools.
+- The Space tools forward `space_id`, `cursor`, `limit`, `include_archived`,
+  `slug` and `version_policy` unchanged and only when given; ArtifactBridge
+  owns their defaults. They return ArtifactBridge's MCP result unchanged as
+  `{"content": [...], "isError": bool}`, including every refusal such as
+  `space_unavailable`, `invalid_cursor` or `skill_not_found`. A tool the
+  server does not offer returns its JSON-RPC error as `{"error": {"code",
+  "message"}}`. The plugin never flattens, pages, installs or retries these
+  results; the other nine tools keep their flattened JSON results.
 - Sends each call as one short-lived streamable-HTTP MCP request to exactly the
   configured tools URL with `Authorization: Bearer <service credential>` and
   `X-ArtifactBridge-Delegation-Token: <token>`. No process-wide header, no
@@ -162,7 +175,7 @@ and [plugin tools](https://hermes-agent.nousresearch.com/docs/developer-guide/pl
    Known limitations). The plugin never changes this setting.
 5. Optional: with Hermes Tool Search at its default, plugin tools are offered
    behind `tool_search`/`tool_call`. Set `tools.tool_search.enabled: "off"` in
-   the serving profile to offer the nine tools directly.
+   the serving profile to offer the eleven tools directly.
 
 Removing the plugin does not revoke enrollment: rotate or disable the service
 in ArtifactBridge separately.
@@ -252,12 +265,12 @@ its denial codes and the renewal route. Registered-tool HTML tests exercise
 schema admission, exact file-to-MCP content, authority stripping, backend error
 and receipt passthrough, and safe retry behavior. Their scripted backend replies
 do not independently verify backend authorization, byte validation or SQL
-idempotency. Local checks used Python 3.14.7, mcp 2.2.0 and httpx2 2.13.1.
+idempotency. Space tool tests likewise script Space map and skill replies and
+refusals as contract fixtures; they prove forwarding, header handling, renewal
+and exact result passthrough, not backend ACL or SQL behavior.
+Local checks used Python 3.14.7, mcp 2.2.0 and httpx2 2.13.1.
 
-`skills-ref validate skills/artifactbridge-delegation` reports a pre-existing
-name/directory mismatch (`delegation` versus `artifactbridge-delegation`). The
-skill metadata is preserved because Hermes registers it as
-`hermes-artifactbridge:delegation`; plugin doctor and validate accept it.
+Validate the bundled skill with `skills-ref validate skills/delegation`.
 
 The plugin was also exercised end to end against ArtifactBridge's own backend
 and a stock Hermes gateway on a loopback journey (dispatch to completion, an

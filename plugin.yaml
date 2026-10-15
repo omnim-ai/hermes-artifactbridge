@@ -23,6 +23,8 @@ provides_tools:
   - artifactbridge_delegation_upload_image
   - artifactbridge_delegation_create_document
   - artifactbridge_delegation_propose_change
+  - artifactbridge_read_space_context
+  - artifactbridge_read_skill
 # No Hermes hooks: the token rides in the task text and the tools are static.
 provides_hooks: []
 # pyproject.toml beside this manifest is what Hermes installs (it wins over this list); kept in sync.

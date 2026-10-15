@@ -69,6 +69,7 @@ class FakeAB:
     ttl_seconds: float = 900
     redirect_renew: bool = False
     service_disabled: bool = False
+    unoffered: set[str] = field(default_factory=set)  # absent from the catalog: JSON-RPC tool-not-found
     now: Callable[[], float] = time.time
 
     # ---- mint at dispatch ----
@@ -144,7 +145,11 @@ class FakeAB:
         elif method == "ping":
             result = {}
         elif method == "tools/list":
-            result = {"tools": [{"name": n, "inputSchema": {"type": "object"}} for n in TOOLS]}
+            result = {"tools": [{"name": n, "inputSchema": {"type": "object"}} for n in TOOLS if n not in self.unoffered]}
+        elif method == "tools/call" and params.get("name") in self.unoffered:
+            self.tool_calls.append((params["name"], params.get("arguments") or {}))
+            return JSONResponse({"jsonrpc": "2.0", "id": rid,
+                                 "error": {"code": -32602, "message": f"Tool {params['name']} not found"}})
         elif method == "tools/call":
             result = self._call(resolved["delegation"], params.get("name", ""), params.get("arguments") or {})
         else:
@@ -220,7 +225,18 @@ def _propose_change(ab: FakeAB, d: Delegation, args: dict) -> dict:
     return _text({"ok": True, "delegation_id": d.id, "review_request_id": "rr-1"})
 
 
+# Minimal Space-bound replies; tests that need exact server shapes script them as fixtures.
+def _read_space_context(ab: FakeAB, d: Delegation, args: dict) -> dict:
+    return _text({"space": {"id": args.get("space_id", "space-bound")}, "skills": {"items": [], "next_cursor": None}})
+
+
+def _read_skill(ab: FakeAB, d: Delegation, args: dict) -> dict:
+    return _text({"slug": args.get("slug"), "source": "managed_document", "content_md": "# skill", "modules": []})
+
+
 TOOLS = {
+    "artifactbridge_read_space_context": _read_space_context,
+    "artifactbridge_read_skill": _read_skill,
     "artifactbridge_delegation_read_brief": _read_brief,
     "artifactbridge_delegation_read_room": _read_room,
     "artifactbridge_delegation_read_document": _read_document,
