@@ -37,8 +37,12 @@ logger = logging.getLogger(__name__)
 
 POOL_PLATFORM = "artifactbridge-pool"
 # Core outcome names; the adapter maps them to A2A task states.
-COMPLETED, INPUT_REQUIRED, FAILED, CANCELED, REJECTED = "completed", "input_required", "failed", "canceled", "rejected"
-_REPORT_OUTCOME = {COMPLETED: "completed", INPUT_REQUIRED: "input_wait", FAILED: "failed", CANCELED: "canceled"}
+COMPLETED, FAILED, CANCELED, REJECTED = "completed", "failed", "canceled", "rejected"
+_REPORT_OUTCOME = {COMPLETED: "completed", FAILED: "failed", CANCELED: "canceled"}
+# Product ruling (2026-10-17): a pooled runner takes initial tasks only, never a continuation (native
+# continuation support is AI-4105). The sender is told to send the task again with the answer.
+_RESEND = ("This runner cannot continue a conversation: send the task again as a new request, with the answer "
+           "included.")
 _UNCERTAIN_TEXT = "ArtifactBridge pooled dispatch outcome uncertain: the executor restarted while it ran."
 
 ControlFactory = Callable[[dict[str, str]], httpx2.Client]
@@ -50,7 +54,14 @@ _REPORTS_PER_PASS = 8
 
 
 def refusal_text(code: str) -> str:
-    return f"ArtifactBridge pooled dispatch refused: {code}"
+    text = f"ArtifactBridge pooled dispatch refused: {code}"
+    return f"{text}. {_RESEND}" if code == "continuation_unsupported" else text
+
+
+def clarification_text(question: str) -> str:
+    """The FAILED result of a turn that asked for clarification; its question went to the Room first."""
+    asked = f" The runner asked: {question}" if question else ""
+    return f"ArtifactBridge pooled task failed: clarification_unsupported. {_RESEND}{asked}"
 
 
 def default_control_factory(headers: dict[str, str]) -> httpx2.Client:
@@ -309,11 +320,10 @@ class PoolCore:
         delegation_id, generation = envelope["binding"]["delegationId"], envelope["binding"]["executionGeneration"]
         if context_id and any(r["delegation_id"] != delegation_id for r in tx.where("context_id", context_id)):
             raise Refused("context_bound_to_other_delegation")
-        # Fail closed: every continuation (a later generation, or a delegation already journaled) is
-        # resume_unavailable, never started fresh. Hermes 0.22.2 cannot hold the original session through
-        # model invocation (hygiene compression can rotate it), so same_session_continuation is not claimed.
+        # Initial tasks only: every continuation (a later generation, or a delegation already journaled) is
+        # refused before any control call, never resumed or started in a replacement session.
         if generation > 1 or tx.where("delegation_id", delegation_id):
-            raise Refused("resume_unavailable")
+            raise Refused("continuation_unsupported")
         return tx.insert(envelope, grant[1], context_id or "ctx-" + uuid.uuid4().hex[:16], _fingerprint(grant[0]),
                          task_id, envelope["dispatchId"])  # admit checked message.messageId == dispatchId
 

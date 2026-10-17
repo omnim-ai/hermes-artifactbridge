@@ -12,7 +12,7 @@ import httpx2
 import pytest
 
 from hermes_artifactbridge import pool_protocol
-from hermes_artifactbridge.pool_core import (COMPLETED, FAILED, INPUT_REQUIRED, POOL_PLATFORM, REJECTED,
+from hermes_artifactbridge.pool_core import (COMPLETED, FAILED, POOL_PLATFORM, REJECTED,
                                              ControlUnavailable, CredentialBindings, PoolControl, PoolCore)
 from hermes_artifactbridge.pool_journal import Journal
 from hermes_artifactbridge.pool_protocol import (IMPLEMENTED_CAPABILITIES, Refused, envelope_from_metadata, report_body, start_request,
@@ -282,7 +282,7 @@ def test_permitted_dispatch_spawns_once_and_reports_running_then_stopped(core, s
     assert len(server.starts) == 1 and len(server.bootstraps) == 1 and len(server.reports) == 2
 
 
-@pytest.mark.parametrize("state, outcome", [(INPUT_REQUIRED, "input_wait"), (FAILED, "failed")])
+@pytest.mark.parametrize("state, outcome", [(COMPLETED, "completed"), (FAILED, "failed")])
 def test_turn_outcomes_map_to_report_outcomes(core, server, state, outcome):
     admit(core, server.issue(envelope()), CTX, "task-1")
     core.finish("task-1", state, "x")
@@ -464,46 +464,46 @@ def test_an_unrelated_task_without_context_gets_a_fresh_session(core, server):
 
 
 @pytest.mark.parametrize("context_id", [CTX, "ctx-elsewhere", ""])
-def test_a_continuation_after_an_input_wait_is_resume_unavailable_on_any_context(core, server, journal_path,
-                                                                                 context_id):
-    # TL ruling: Hermes cannot hold the original session through the model turn, so no continuation runs.
+def test_a_continuation_after_a_clarification_is_continuation_unsupported_on_any_context(core, server, journal_path,
+                                                                                        context_id):
+    # Product ruling: initial tasks only; a clarification ended the first task as failed.
     admit(core, server.issue(envelope()), CTX, "task-1")
-    core.finish("task-1", INPUT_REQUIRED, "need more")
+    core.finish("task-1", FAILED, "clarification_unsupported")
     before = len(server.requests)
     decision = admit(core, server.issue(continuation(42)), context_id, "task-2")
-    assert (decision.kind, decision.outcome) == ("terminal", REJECTED) and "resume_unavailable" in decision.text
+    assert (decision.kind, decision.outcome) == ("terminal", REJECTED)
+    assert "continuation_unsupported" in decision.text and "send the task again" in decision.text
     assert len(server.requests) == before and len(rows(journal_path)) == 1  # no start, bootstrap or new row
 
 
-def test_a_continuation_for_a_session_unknown_to_the_journal_is_resume_unavailable(core, server, journal_path):
+def test_a_continuation_for_a_session_unknown_to_the_journal_is_continuation_unsupported(core, server, journal_path):
     decision = admit(core, server.issue(continuation(40)), CTX, "task-1")
-    assert decision.outcome == REJECTED and "resume_unavailable" in decision.text
+    assert decision.outcome == REJECTED and "continuation_unsupported" in decision.text
     assert rows(journal_path) == [] and server.requests == []
 
 
-def test_the_fixture_continuation_with_its_own_grant_is_resume_unavailable_before_any_control_call(core, server,
-                                                                                                   journal_path):
+def test_the_fixture_continuation_with_its_own_grant_is_refused_before_any_control_call(core, server, journal_path):
     context_id = fixture("cloud-send-request.json")["body"]["params"]["message"]["contextId"]
     admit(core, server.issue(envelope()), context_id, "task-1")
-    core.finish("task-1", INPUT_REQUIRED, "which tone?")
+    core.finish("task-1", FAILED, "clarification_unsupported")
     request = fixture("cloud-continuation-request.json")
     params = request["body"]["params"]
     grant = (request["headers"]["x-ab-control-credential"], request["headers"]["x-ab-start-journal-id"])
     before = len(server.requests)
     decision = core.admit(server.issue(envelope_from_metadata(params["metadata"])), params["message"]["contextId"],
                           "task-2", grant=grant, message_id=params["message"]["messageId"])
-    assert decision.outcome == REJECTED and "resume_unavailable" in decision.text
+    assert decision.outcome == REJECTED and "continuation_unsupported" in decision.text
     assert len(server.requests) == before and len(rows(journal_path)) == 1
 
 
-@pytest.mark.parametrize("first_outcome", [COMPLETED, FAILED, None])
-def test_a_continuation_without_a_retained_input_wait_is_resume_unavailable(core, server, first_outcome):
+@pytest.mark.parametrize("first_outcome", [COMPLETED, None])
+def test_a_continuation_after_any_first_outcome_is_continuation_unsupported(core, server, first_outcome):
     admit(core, server.issue(envelope()), CTX, "task-1")
     if first_outcome:
         core.finish("task-1", first_outcome, "")
     before = len(server.requests)
     decision = admit(core, server.issue(continuation(42)), CTX, "task-2")
-    assert decision.outcome == REJECTED and "resume_unavailable" in decision.text
+    assert decision.outcome == REJECTED and "continuation_unsupported" in decision.text
     assert len(server.requests) == before
 
 
@@ -548,9 +548,9 @@ def test_cancel_acknowledges_with_its_own_binding_and_a_late_result_touches_noth
     reports = list(server.reports)
     core.finish("task-1", COMPLETED, "late result")  # the canceled turn finishing anyway
     assert server.reports == reports
-    # A canceled turn is no retained input wait: a continuation of it never resumes the session.
+    # A continuation of a canceled turn never resumes the session.
     resumed = admit(core, server.issue(continuation(42)), CTX, "task-2")
-    assert resumed.outcome == REJECTED and "resume_unavailable" in resumed.text
+    assert resumed.outcome == REJECTED and "continuation_unsupported" in resumed.text
     states = {r["assignment_id"]: (r["state"], r["result_state"]) for r in rows(journal_path)}
     assert states == {envelope()["binding"]["assignmentId"]: ("finished", "canceled")}
     assert core.cancel("task-1") is False
@@ -562,7 +562,7 @@ def test_refused_rows_are_kept_so_the_context_stays_known(core, server, journal_
     server.refuse_start = None
     assert len(rows(journal_path)) == 1
     decision = admit(core, server.issue(continuation(42)), "ctx-elsewhere", "task-2")
-    assert "resume_unavailable" in decision.text and len(rows(journal_path)) == 1
+    assert "continuation_unsupported" in decision.text and len(rows(journal_path)) == 1
 
 
 # ---- secrets ----

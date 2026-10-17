@@ -131,7 +131,11 @@ class PooledTools:
         return handler
 
     async def invoke(self, name: str, args: dict) -> dict:
-        platform, context_id, task_id = session_route()
+        return await self.invoke_for(session_route(), name, args)
+
+    async def invoke_for(self, route: tuple[str, str, str], name: str, args: dict) -> dict:
+        """``invoke`` for the (platform, contextId, task id) ``route`` the caller names, outside the turn."""
+        platform, context_id, task_id = route
         credential = (await asyncio.to_thread(self._credentials.lookup, platform, context_id, task_id)
                       if platform == POOL_PLATFORM else None)
         if credential is None:

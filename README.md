@@ -222,11 +222,12 @@ server's requests (see Start headers).
   executor id, connection revision, protocol version and the six capabilities
   this plugin implements with this plugin's version, only when they match this
   executor's configuration and every required capability is one of those six;
-  otherwise it answers a JSON-RPC error and no result. It does not implement
-  `same_session_continuation`, so the server's probe for the full cloud set of
-  seven gets an error: the pooled runner is deliberately ineligible for cloud
-  pool admission. It needs no start headers and never claims open-pool
-  consent.
+  otherwise it answers a JSON-RPC error and no result. The runner takes initial
+  tasks only and does not claim `same_session_continuation`: a probe for the six
+  succeeds, and a probe that requires `same_session_continuation` (the current
+  server probe asks for all seven) is refused `capability_mismatch`. Aligning
+  the server's eligibility check to the six is owned server-side, outside this
+  plugin. It needs no start headers and never claims open-pool consent.
 - **Start headers.** Send, Get, List and Cancel must carry exactly one
   `X-AB-Pool-Protocol-Version: 1`, one `X-AB-Control-Credential: agx_...` and
   one `X-AB-Start-Journal-Id` (printable ASCII, at most 128). Anything missing,
@@ -282,15 +283,21 @@ server's requests (see Start headers).
   is re-bootstrapped and retried exactly once (one refresh per task at a time;
   a refresh never starts a turn). Legacy tools refuse with
   `pooled_session_requires_pooled_tools` inside a pooled session.
-- **Sessions.** Continuations are not supported. Hermes 0.22.2 cannot hold
-  the original session through model invocation (hygiene compression can
-  rotate it), so every continuation (a higher execution generation, or another
-  assignment of a delegation already journaled) is refused
-  `resume_unavailable` before any control call: no start, no bootstrap, no
-  turn and no journal row, even when the earlier generation's Hermes session
-  still exists. A context bound to another delegation is refused
-  `context_bound_to_other_delegation`. Cloud source interop stays blocked
-  until Hermes enforces the original session through model invocation.
+- **Clarification.** A pooled runner cannot continue a conversation. When a
+  turn's reply starts with `[INPUT_REQUIRED]`, the plugin posts the question
+  to the Room as a `question` event through the pooled contribute tool, under
+  the task's own `dlc_`, before anything terminal is recorded. The task then
+  ends `TASK_STATE_FAILED` with `clarification_unsupported`, telling the
+  sender to send the task again as a new request with the answer included, and
+  quoting the question. It is reported `stopped`/`failed`, never an input wait;
+  Get and a repeated Send answer the same failure.
+- **Sessions.** Continuations are not supported (native support is tracked as
+  AI-4105). Every continuation (a higher execution generation, or another
+  assignment of a delegation already journaled) is rejected
+  `continuation_unsupported`, with the same resend guidance, before any control
+  call: no start, no bootstrap, no turn, no Hermes session and no journal row.
+  A context bound to another delegation is refused
+  `context_bound_to_other_delegation`.
 - **Journal on disk.** With pooled mode on, the plugin writes a SQLite (WAL)
   journal at `<HERMES_HOME>/artifactbridge/pool-journal.sqlite3`: one row per
   (assignmentId, dispatchId) with the envelope, the server's startJournalId,

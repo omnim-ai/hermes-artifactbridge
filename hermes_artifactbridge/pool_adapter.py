@@ -17,7 +17,8 @@ import logging
 import threading
 import time
 
-from .pool_core import CANCELED, COMPLETED, FAILED, INPUT_REQUIRED, POOL_PLATFORM, REJECTED, Decision, refusal_text
+from .pool_core import (CANCELED, COMPLETED, FAILED, POOL_PLATFORM, REJECTED, Decision, clarification_text,
+                        refusal_text)
 from .pool_protocol import CAPABILITY_METHOD, METADATA_KEY, Refused, capability_answer, pool_grant
 
 logger = logging.getLogger(__name__)
@@ -71,10 +72,9 @@ def build_adapter_class():
     from plugins.platforms.a2a import protocol, security
     from plugins.platforms.a2a.adapter import _MAX_BODY, A2AAdapter, A2ARequestHandler, _err, _ok
 
-    a2a_state = {COMPLETED: protocol.STATE_COMPLETED, INPUT_REQUIRED: protocol.STATE_INPUT_REQUIRED,
-                 FAILED: protocol.STATE_FAILED, CANCELED: protocol.STATE_CANCELED, REJECTED: protocol.STATE_REJECTED}
-    core_outcome = {protocol.STATE_COMPLETED: COMPLETED, protocol.STATE_INPUT_REQUIRED: INPUT_REQUIRED,
-                    protocol.STATE_CANCELED: CANCELED}
+    a2a_state = {COMPLETED: protocol.STATE_COMPLETED, FAILED: protocol.STATE_FAILED, CANCELED: protocol.STATE_CANCELED,
+                 REJECTED: protocol.STATE_REJECTED}
+    core_outcome = {protocol.STATE_COMPLETED: COMPLETED, protocol.STATE_CANCELED: CANCELED}
     methods = {"SendMessage": "_pool_send", "GetTask": "_pool_get", "ListTasks": "_pool_list",
                "CancelTask": "_pool_cancel", CAPABILITY_METHOD: "_pool_capability"}
 
@@ -138,11 +138,12 @@ def build_adapter_class():
             self._json(200, getattr(adapter, handler_name)(req_id, params, identity, grant))
 
     class PoolAdapter(A2AAdapter):
-        def __init__(self, config, *, core, port: int):
+        def __init__(self, config, *, core, tools, port: int):
             super().__init__(config)
             self.platform = Platform(POOL_PLATFORM)
             self.port = port
             self._core = core
+            self._tools = tools  # the pooled scoped tools (PooledTools), for a clarification's Room question
             self._events: dict[str, object] = {}  # A2A task id -> its MessageEvent, for a session cancel
             self._admitted: dict[str, threading.Event] = {}  # set once Hermes admitted the task's turn
             self._finalizers: dict[str, threading.Thread] = {}  # waits on the task's reply, records its outcome
@@ -320,8 +321,20 @@ def build_adapter_class():
             await super().on_processing_start(event)
 
         def _finalize_task(self, pending, state, reply):
-            state, reply = super()._finalize_task(pending, state, reply)
             task_id = pending["task_id"]
+            stripped = security.redact_outbound(reply or "").lstrip()
+            if state == protocol.STATE_COMPLETED and stripped.upper().startswith(protocol.INPUT_REQUIRED_MARKER):
+                # A clarification cannot be continued here (product ruling; AI-4105): its question goes to the
+                # Room under this task's dlc_ (still bound), then the task fails with resend guidance.
+                question = stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
+                if question:
+                    posted = asyncio.run(self._tools.invoke_for(
+                        (POOL_PLATFORM, pending["context_id"], task_id), "artifactbridge_pool_delegation_contribute",
+                        {"kind": "question", "body": question, "idempotency_key": f"clarification-{task_id}"}))
+                    if "error" in posted:
+                        logger.warning("artifactbridge pooled clarification not posted: %s", posted["error"])
+                state, reply = protocol.STATE_FAILED, clarification_text(question)
+            state, reply = super()._finalize_task(pending, state, reply)
             # Only this task's own row; a replaced row is left untouched and unreported.
             if state == protocol.STATE_CANCELED and task_id in self._cancel_requested:
                 self._core.cancel(task_id)
