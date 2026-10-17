@@ -180,7 +180,7 @@ and [plugin tools](https://hermes-agent.nousresearch.com/docs/developer-guide/pl
 Removing the plugin does not revoke enrollment: rotate or disable the service
 in ArtifactBridge separately.
 
-## Pooled execution (protocol v1, not yet usable against a deployed server)
+## Pooled execution (protocol v1, cloud-contract-r2, not yet usable against a deployed server)
 
 Pooled (assignment-bound) execution lets ArtifactBridge dispatch one exact
 assignment to this executor instead of putting a `dlt_` token in the task
@@ -188,22 +188,54 @@ text. It is **off by default** and changes nothing until you opt in:
 
 ```
 ARTIFACTBRIDGE_POOL_ENABLED=1
-ARTIFACTBRIDGE_POOL_EXECUTOR_CREDENTIAL=agx_...     # control only; runtime-only, never logged or stored
 ARTIFACTBRIDGE_POOL_EXECUTOR_ID=<executor uuid>
 ARTIFACTBRIDGE_POOL_CONNECTION_REVISION=<revision>
 ARTIFACTBRIDGE_POOL_PORT=9901                       # optional; else platform extra.port, else 9901
+A2A_BEARER_TOKEN=<remote bearer>                    # or A2A_PEER_TOKENS; required, see below
 ```
 
-All four settings must be present and well formed (and the tools URL trusted);
+The three settings must be present and well formed (and the tools URL trusted);
 otherwise `register()` registers exactly the legacy surface above. They are read
-through the same profile-scoped reader as the service credential.
+through the same profile-scoped reader as the service credential. There is no
+executor-wide control credential: each assignment's `agx_` arrives with the
+server's requests (see Start headers).
 
 - **Separate listener.** Pooled mode registers its own Hermes platform,
   `artifactbridge-pool`, a thin subclass of the stock A2A adapter on its own
   port. The stock `a2a` platform and the legacy `dlt_` flow are unchanged. The
-  pooled listener keeps the stock platform hint and inbound framing; it does not
-  forward to other profiles.
-- **Intercept before the model.** Every request on that listener must carry
+  pooled listener keeps the stock platform hint, inbound framing, audit,
+  history and per-context anti-loop turn counter; it does not forward to other
+  profiles.
+- **Remote bearer.** The listener uses the stock A2A bearer
+  (`A2A_BEARER_TOKEN` or `A2A_PEER_TOKENS`, stock `A2A_HOST`/trusted-peer rules)
+  and refuses to serve without one (`bearer_required`, not retryable). Every
+  request needs it, the Agent Card GET included: a missing, repeated or wrong
+  `Authorization` header is HTTP 401 before anything is read. A
+  `Content-Length` that is repeated or not plain decimal digits is HTTP 400
+  before the body is read. Request headers are never logged, audited or
+  journaled.
+- **Methods.** Only `SendMessage`, `GetTask`, `ListTasks`, `CancelTask` and
+  `artifactbridge/pool/capability` (JSON-RPC, A2A 1.0) are served on the root
+  route; any other method is `-32601 Method not found` and a served-agent
+  route is refused. No request reaches the stock handlers.
+- **Capability.** `artifactbridge/pool/capability` echoes the server's nonce,
+  executor id, connection revision, protocol version and the seven required
+  capabilities with this plugin's version, only when they all match this
+  executor's configuration; otherwise it answers a JSON-RPC error and no
+  result. It needs no start headers and never claims open-pool consent.
+- **Start headers.** Send, Get, List and Cancel must carry exactly one
+  `X-AB-Pool-Protocol-Version: 1`, one `X-AB-Control-Credential: agx_...` and
+  one `X-AB-Start-Journal-Id` (printable ASCII, at most 128). Anything missing,
+  repeated or malformed is a JSON-RPC `-32602` (`invalid_pool_headers`) before
+  any task, event, journal row or control call. The journal id must be the one
+  the server derives for the envelope's assignment (`agj_` plus the dashless
+  assignment id), else `journal_mismatch`. The plugin never mints a journal id:
+  it starts the assignment the server already started (`/start` replays the
+  server's journal) and authenticates `/start`, `/bootstrap` and `/report` with
+  that assignment's own `agx_`. The `agx_` is held in memory per journal id
+  only; the journal stores its SHA-256 fingerprint, and a later request with
+  another `agx_` for the same assignment is refused `grant_mismatch`.
+- **Intercept before the model.** Every Send must carry
   `params.metadata["artifactbridge.assignment"]` (protocol v1, strict). A missing,
   malformed or unknown-version envelope, another executor or connection
   revision, a tuple that differs from the journaled one, a refused or
@@ -213,21 +245,52 @@ through the same profile-scoped reader as the service credential.
   that (platform, contextId, task id) only. `startBy` is checked again after
   bootstrap: if it has passed, the credential is discarded, the dispatch is
   refused `start_deadline_passed` and reported `stopped`/`failed`.
+- **Send answers at once.** Send never waits for the reply. It waits up to 5 s
+  for Hermes to admit the turn and answers `TASK_STATE_WORKING` once admitted
+  (`running` is reported then, not at spawn), else `TASK_STATE_SUBMITTED`. The
+  task's `metadata["artifactbridge.assignment"]` is the envelope plus
+  `startJournalId`, which the server matches tasks by. The A2A task id is
+  journaled with the dispatch before the first answer, so a repeated Send for
+  the same journal answers the same task id (its refusal, result, or running
+  turn) and never starts a second turn. If `/start` gets no answer, the Send
+  answers that task id as failed `start_unavailable` while the row stays
+  retryable: the next Send asks again with the same startJournalId and runs as
+  the same task id. A request refused before journaling (bad envelope,
+  another executor, a foreign grant) has no row and gets a fresh rejected task.
+- **Get, List, Cancel.** They read the journal row the start headers name
+  (journal id and `agx_` fingerprint) and never create a row or start a turn.
+  An unknown or foreign journal is `-32001 task not found` (List: an empty
+  page). Cancel stops the turn through Hermes' own session cancel; the task is
+  `TASK_STATE_CANCELED` (and `cancel_acknowledged` is reported with its own
+  binding) only once the runtime confirmed the stop. Otherwise it stays live
+  with `metadata["artifactbridge.cancel"] = "pending"` and later records its
+  real outcome. A finished task is `-32002 not cancelable`.
 - **Pooled tools.** Toolset `artifactbridge-pool` holds token-free
   `artifactbridge_pool_*` variants of the eleven tools (same server tools on the
   wire). They present only the current task's `dlc_` as `Authorization: Bearer`,
   with no delegation-token header and no service credential. Without a binding
-  they return `pooled_credential_unavailable`; an expired credential is returned
-  as-is (no renewal). Legacy tools refuse with
+  they return `pooled_credential_unavailable`. A `dlc_` within 60 s of its
+  `expiresAt` is re-bootstrapped before use, and a `credential_expired` denial
+  is re-bootstrapped and retried exactly once (one refresh per task at a time;
+  a refresh never starts a turn). Legacy tools refuse with
   `pooled_session_requires_pooled_tools` inside a pooled session.
 - **Sessions.** A delegation stays on its first A2A contextId. A continuation
-  (new assignment, higher execution generation) must arrive on that context;
-  otherwise it is refused with `resume_unavailable`, never started fresh.
+  (new assignment, higher execution generation, its own `agx_` and journal id)
+  must arrive on that context and only after the latest earlier generation
+  ended in input-required, and the Hermes session that input wait ended in
+  (recorded in the journal at finish) must still be the gateway session
+  store's current session for its key. After a `/new` reset, an idle or daily
+  rollover, or a lost session store, it is refused `resume_unavailable`, never
+  started in a fresh session. It runs as a new A2A task on the same context.
+  Known gap: Hermes can still roll the session over between that check and
+  the turn; closing it needs a reset-free Hermes session lookup.
 - **Journal on disk.** With pooled mode on, the plugin writes a SQLite (WAL)
   journal at `<HERMES_HOME>/artifactbridge/pool-journal.sqlite3`: one row per
-  (assignmentId, dispatchId) with the envelope, a local startJournalId, state,
-  A2A ids, report sequence and the recorded result. It never holds an `agx_` or
-  `dlc_` value. Rows are never deleted; there is no cleanup sweep.
+  (assignmentId, dispatchId) with the envelope, the server's startJournalId,
+  the `agx_` fingerprint, state, A2A ids, report sequence, the recorded
+  result and the Hermes session key and id the turn ended in. It never holds
+  an `agx_` or `dlc_` value. Rows are never deleted;
+  there is no cleanup sweep.
 - **Retries and restart.** A repeated delivery of a dispatch reads its row: a
   running turn is not started twice, a finished or refused dispatch gets its
   recorded answer, and an unanswered start is resent with the same
@@ -237,46 +300,31 @@ through the same profile-scoped reader as the service credential.
 - **Durable reports.** Each `running`, `stopped` and `cancel_acknowledged`
   report is written to the journal row (`pending_reports`) in the same
   transaction that allocates its `reportSequence` and makes the state change,
-  then sent outside it, each row's oldest sequence first. A report leaves the
-  journal only when the server answers `{recorded, currentOccupant}`, including
-  `recorded: false` (a replay of a recorded sequence). `scheduler_busy` is
-  retried twice inline (0.05 s, 0.2 s); any other failure leaves the report
-  pending, and the next `admit` (after its own start path), `finish`, `cancel`
-  or adapter start sends it, at most 8 per pass and stopping at the first
-  failure. A named refusal is recorded in `report_refusal` and never retried.
-- **Cancel.** `tasks/cancel` sends `cancel_acknowledged` with that task's own
-  binding and drops its credential. A late result from a canceled turn changes
-  only its own row and never reports for a newer assignment.
+  then sent outside it, each row's oldest sequence first, with that row's
+  `agx_`. After a restart the process holds no `agx_`, so a row's reports wait
+  until the server's next Send/Get/List/Cancel presents it again. A report
+  leaves the journal only when the server answers `{recorded, currentOccupant}`,
+  including `recorded: false` (a replay of a recorded sequence).
+  `scheduler_busy` is retried twice inline (0.05 s, 0.2 s); any other failure
+  leaves the report pending, and the next admit (after its own start path),
+  finish, cancel, recovery read or adapter start sends it, at most 8 per pass
+  and stopping at the first failure. A named refusal is not an
+  acknowledgment: the report stays in `pending_reports`, the refusal is
+  recorded in `report_refusal` (apart from the row's execution state), and
+  that row's reports are never retried or overtaken by a later sequence.
 
-**Server contract.** Routes and shapes match artifact-forge
-`src/routes/agent-gateway-pool.ts` at `c0b4de56c` and the integration-u3-r1
-fixtures in `tests/fixtures/pooled_v1` (see `SOURCE.md`). That server code is
-not merged or deployed. Calls go to `POST /api/agent-gateway/pool/start`,
-`/bootstrap` and `/report` and to `GET`/`POST /api/agent-gateway/pool/capability`
-on the tools URL's origin with `Authorization: Bearer agx_...`; redirects are
-never followed. Status mapping: a contract 409 refusal (`start_owned`,
+**Server contract.** Routes, headers and shapes match artifact-forge
+`a26eb977c476d7b2efd1c636deaa7e74f31c50c2` (cloud-contract-r2) and its generated
+fixtures in `tests/fixtures/cloud_r2` (see `SOURCE.md`). That server code is not
+merged or deployed, and its CI database/runtime is not certified. Calls go to
+`POST /api/agent-gateway/pool/start`, `/bootstrap` and `/report` on the tools
+URL's origin with `Authorization: Bearer agx_...`; redirects are never
+followed. Status mapping: a contract 409 refusal (`start_owned`,
 `start_deadline_passed`, `start_not_authorized`, `withdrawn`, any named error
 code) and 401/403/400 are terminal refusals, never retried; `scheduler_busy` is
 retried; any other status or a body that is not exactly the contract shape is
 "unavailable". Bootstrap sends `{protocolVersion, binding, startJournalId}` and
 accepts only `{credential: dlc_..., expiresAt}`.
-
-Open gaps that keep this from running against a real server:
-
-- GAP-A: no server path delivers an `agx_` to a cloud executor (the server
-  mints one only in the tray start response, which this plugin never adopts).
-  The configured `ARTIFACTBRIDGE_POOL_EXECUTOR_CREDENTIAL` is scaffolding.
-- GAP-B: the plugin generates its own startJournalId. For a cloud start the
-  server issues a permit only when the request replays the journal id the
-  server chose; otherwise it answers `start_not_authorized`, and the plugin
-  ends the task rejected with no bootstrap and no turn. The self-generated id is
-  scaffolding until the server delivers its journal id.
-- Capability transport: `PoolControl.prove_capability` GETs the challenge,
-  answers it and POSTs the proof; nothing in the plugin calls it on its own.
-  A successful GET is not evidence of eligibility: only the POST is verified,
-  in SQL, and the proof never claims open-pool consent.
-  `capability_proof(challenge)` remains the pure function for a challenge
-  obtained another way.
 
 Contract ambiguities, as implemented:
 
@@ -288,25 +336,25 @@ Contract ambiguities, as implemented:
 - After a crash between permit and spawn, the row returns to `start_requested`
   and a retry sends the same startJournalId and bootstraps again; the server
   revokes the earlier `dlc_`.
-- A `dlc_` lasts 15 minutes and is never refreshed; a longer turn's pooled
-  tools fail with the server's credential error.
-- The pooled listener does not apply the stock adapter's per-context anti-loop
-  turn counter.
+- A header refusal is a JSON-RPC error at HTTP 200, and the Agent Card GET
+  requires the bearer.
 - The `send` override that resolves only the task named by `reply_to` is
-  unit-tested against the stock adapter class but not proven in a live gateway
+  tested against the stock adapter over HTTP but not proven in a live gateway
   turn.
-- Pooled requests do not increment the stock A2A `inbound_total` metric:
-  rebinding that Hermes module attribute fails `hermes plugins validate`.
-  Validation passes, but it warns about private core imports
-  (`plugins.platforms.a2a.*`, `gateway.session_context`,
+- Pooled requests do not increment the stock A2A `inbound_total` or
+  `anti_loop_triggers` metrics: rebinding a Hermes module attribute fails
+  `hermes plugins validate`. Validation passes, but it warns about private core
+  imports (`plugins.platforms.a2a.*`, `gateway.session_context`,
   `hermes_cli.plugins_manifest`). They are inherent to subclassing the stock
-  adapter, which is why the runtime shape and version gate exist.
+  adapter and its request handler, which is why the runtime shape and version
+  gate exist.
 
 **Not proven.** No pooled journey has run against a real ArtifactBridge server
-or a live Hermes gateway. The tests use a fake control server and a fake
-MCP boundary, plus the stock Hermes 0.22.2 A2A adapter in-process. The pooled
-platform refuses to register on any Hermes outside `>=0.22.2,<0.23` or with a
-different A2A adapter shape.
+or a live Hermes gateway. The tests drive the listener's real socket with the
+generated fixture requests, the stock Hermes 0.22.2 A2A adapter and message
+pipeline in-process, a fake control server and a fake MCP boundary; only the
+model is a stand-in. The pooled platform refuses to register on any Hermes
+outside `>=0.22.2,<0.23` or with a different A2A adapter or handler shape.
 
 ## Installation
 
