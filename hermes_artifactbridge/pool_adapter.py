@@ -251,8 +251,10 @@ def build_adapter_class():
                 decision = Decision("terminal", context_id, outcome=REJECTED, text=refusal_text("empty_task"))
             else:
                 try:
+                    message = params.get("message")
                     decision = self._core.admit(params.get("metadata"), context_id, task_id, grant=grant,
-                                                session_of=self._session_id)
+                                                message_id=message.get("messageId") if isinstance(message, dict)
+                                                else None)
                 except Exception as exc:  # fail closed: never the stock path
                     logger.warning("artifactbridge pooled intercept failed: %s", type(exc).__name__)
                     decision = Decision("terminal", context_id, outcome=FAILED, text=refusal_text("intercept_failed"))
@@ -269,11 +271,6 @@ def build_adapter_class():
                                     *self._scope_for_agent(None))
             task = self._end_task(rec, a2a_state[decision.outcome], decision.text, stored_reply=decision.text)[0]
             return self._with_assignment(task, row) if row is not None and row["task_id"] == task_id else task
-
-        def _session_id(self, session_key: str):
-            """The Hermes session currently behind ``session_key`` (None without a gateway session store)."""
-            peek = getattr(getattr(self, "_session_store", None), "peek_session_id", None)
-            return peek(session_key) if callable(peek) and session_key else None
 
         def _dispatch(self, params, peer, context_id, task_id) -> None:
             """The stock local dispatch (anti-loop, framing, audit, persistence, push) under the permitted ids.
@@ -328,10 +325,8 @@ def build_adapter_class():
             # Only this task's own row; a replaced row is left untouched and unreported.
             if state == protocol.STATE_CANCELED and task_id in self._cancel_requested:
                 self._core.cancel(task_id)
-            else:  # the Hermes session the turn ended in: a continuation must find it still current
-                event = self._events.get(task_id)
-                key = self._event_session_key(event) if event is not None else ""
-                self._core.finish(task_id, core_outcome.get(state, FAILED), reply, (key, self._session_id(key)))
+            else:
+                self._core.finish(task_id, core_outcome.get(state, FAILED), reply)
             self._cancel_requested.discard(task_id)
             for live in (self._events, self._admitted, self._finalizers):
                 live.pop(task_id, None)

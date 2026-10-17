@@ -219,10 +219,14 @@ server's requests (see Start headers).
   route; any other method is `-32601 Method not found` and a served-agent
   route is refused. No request reaches the stock handlers.
 - **Capability.** `artifactbridge/pool/capability` echoes the server's nonce,
-  executor id, connection revision, protocol version and the seven required
-  capabilities with this plugin's version, only when they all match this
-  executor's configuration; otherwise it answers a JSON-RPC error and no
-  result. It needs no start headers and never claims open-pool consent.
+  executor id, connection revision, protocol version and the six capabilities
+  this plugin implements with this plugin's version, only when they match this
+  executor's configuration and every required capability is one of those six;
+  otherwise it answers a JSON-RPC error and no result. It does not implement
+  `same_session_continuation`, so the server's probe for the full cloud set of
+  seven gets an error: the pooled runner is deliberately ineligible for cloud
+  pool admission. It needs no start headers and never claims open-pool
+  consent.
 - **Start headers.** Send, Get, List and Cancel must carry exactly one
   `X-AB-Pool-Protocol-Version: 1`, one `X-AB-Control-Credential: agx_...` and
   one `X-AB-Start-Journal-Id` (printable ASCII, at most 128). Anything missing,
@@ -236,7 +240,11 @@ server's requests (see Start headers).
   only; the journal stores its SHA-256 fingerprint, and a later request with
   another `agx_` for the same assignment is refused `grant_mismatch`.
 - **Intercept before the model.** Every Send must carry
-  `params.metadata["artifactbridge.assignment"]` (protocol v1, strict). A missing,
+  `params.metadata["artifactbridge.assignment"]` (protocol v1, strict;
+  `commandSequence` is the integer 1, in the envelope and in the start permit)
+  and a `params.message.messageId` exactly equal to the envelope's
+  `dispatchId` (else `message_id_mismatch`, also for a repeated Send with an
+  altered messageId). A missing,
   malformed or unknown-version envelope, another executor or connection
   revision, a tuple that differs from the journaled one, a refused or
   mismatched start permit, or a passed `startBy` ends the A2A task as
@@ -274,21 +282,20 @@ server's requests (see Start headers).
   is re-bootstrapped and retried exactly once (one refresh per task at a time;
   a refresh never starts a turn). Legacy tools refuse with
   `pooled_session_requires_pooled_tools` inside a pooled session.
-- **Sessions.** A delegation stays on its first A2A contextId. A continuation
-  (new assignment, higher execution generation, its own `agx_` and journal id)
-  must arrive on that context and only after the latest earlier generation
-  ended in input-required, and the Hermes session that input wait ended in
-  (recorded in the journal at finish) must still be the gateway session
-  store's current session for its key. After a `/new` reset, an idle or daily
-  rollover, or a lost session store, it is refused `resume_unavailable`, never
-  started in a fresh session. It runs as a new A2A task on the same context.
-  Known gap: Hermes can still roll the session over between that check and
-  the turn; closing it needs a reset-free Hermes session lookup.
+- **Sessions.** Continuations are not supported. Hermes 0.22.2 cannot hold
+  the original session through model invocation (hygiene compression can
+  rotate it), so every continuation (a higher execution generation, or another
+  assignment of a delegation already journaled) is refused
+  `resume_unavailable` before any control call: no start, no bootstrap, no
+  turn and no journal row, even when the earlier generation's Hermes session
+  still exists. A context bound to another delegation is refused
+  `context_bound_to_other_delegation`. Cloud source interop stays blocked
+  until Hermes enforces the original session through model invocation.
 - **Journal on disk.** With pooled mode on, the plugin writes a SQLite (WAL)
   journal at `<HERMES_HOME>/artifactbridge/pool-journal.sqlite3`: one row per
   (assignmentId, dispatchId) with the envelope, the server's startJournalId,
-  the `agx_` fingerprint, state, A2A ids, report sequence, the recorded
-  result and the Hermes session key and id the turn ended in. It never holds
+  the `agx_` fingerprint, state, A2A ids (contextId, task id and the Send's
+  messageId), report sequence and the recorded result. It never holds
   an `agx_` or `dlc_` value. Rows are never deleted;
   there is no cleanup sweep.
 - **Retries and restart.** A repeated delivery of a dispatch reads its row: a

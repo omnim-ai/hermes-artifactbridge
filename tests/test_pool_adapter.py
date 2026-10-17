@@ -13,9 +13,8 @@ import pytest
 
 pytest.importorskip("plugins.platforms.a2a.adapter", exc_type=ImportError)
 
-from gateway.config import GatewayConfig, PlatformConfig  # noqa: E402
+from gateway.config import PlatformConfig  # noqa: E402
 from gateway.platform_registry import PlatformEntry, platform_registry  # noqa: E402
-from gateway.session import SessionStore  # noqa: E402
 from plugins.platforms.a2a import _PLATFORM_HINT, protocol  # noqa: E402
 
 import hermes_artifactbridge as plugin_module  # noqa: E402
@@ -79,9 +78,9 @@ class Model:
     number (0, 1, ...) to ``"block"`` (wait until released or canceled), ``"stubborn"`` (ignore a cancel
     until released) or a reply text (default "done")."""
 
-    def __init__(self, credentials, sessions):
-        self.credentials, self.sessions = credentials, sessions
-        self.turns, self.seen_credentials, self.behavior, self.session_ids = [], [], {}, []
+    def __init__(self, credentials):
+        self.credentials = credentials
+        self.turns, self.seen_credentials, self.behavior = [], [], {}
         self.started = [threading.Event() for _ in range(4)]
         self.release = threading.Event()
 
@@ -90,8 +89,6 @@ class Model:
         self.turns.append(event)
         self.seen_credentials.append(self.credentials.lookup(event.source.platform.value, event.source.chat_id,
                                                              event.source.message_id))
-        # The gateway runner opens (or resumes) the turn's Hermes session before the agent runs.
-        self.session_ids.append((await asyncio.to_thread(self.sessions.get_or_create_session, event.source)).session_id)
         self.started[n].set()
         behavior = self.behavior.get(n, "done")
         if behavior == "block":
@@ -118,9 +115,7 @@ class Listener:
                              now=server.clock)
         self.adapter = pool_adapter.build_adapter_class()(PlatformConfig(enabled=True, extra={}), core=self.core,
                                                           port=0)
-        self.sessions = SessionStore(journal_path.parent / "sessions", GatewayConfig())  # Hermes' real store
-        self.adapter.set_session_store(self.sessions)
-        self.model = Model(self.credentials, self.sessions)
+        self.model = Model(self.credentials)
         self.adapter.set_message_handler(self.model)
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
@@ -169,11 +164,26 @@ class Listener:
         self.thread.join(5)
 
     def stop(self):
+        """Test teardown, also for a crashed listener: release the model, cancel and await every task still
+        on the loop (released, stubborn, canceled or abandoned by the crash), then close the loop."""
         if self.adapter._httpd is not None:
             self.run(self.adapter.disconnect())
         self.model.release.set()
-        self.loop.call_soon_threadsafe(self.loop.stop)
-        self.thread.join(5)
+        if self.thread.is_alive():
+            self.run(self._drain())
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            self.thread.join(5)
+        else:  # crashed: its loop stopped with the turn in flight
+            self.loop.run_until_complete(self._drain())
+        self.loop.run_until_complete(self.loop.shutdown_default_executor())
+        self.loop.close()
+
+    @staticmethod
+    async def _drain():
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @pytest.fixture
@@ -191,7 +201,8 @@ def listeners(registered, server, journal_path):
 
     yield start
     for listener in reversed(started):
-        listener.stop()
+        if not listener.loop.is_closed():
+            listener.stop()
 
 
 @pytest.fixture
@@ -284,10 +295,17 @@ def test_the_card_pins_the_registered_listener_url_on_the_jsonrpc_binding(listen
 
 
 def test_the_capability_request_is_answered_from_this_executors_configuration(listener, server):
-    status, answer = listener.call("cloud-capability-request.json")
+    # TL ruling: the fixture probe requires same_session_continuation, which this runner does not claim, so
+    # it gets an error (a deliberately ineligible runner); the supported subset is echoed.
+    status, refused = listener.call("cloud-capability-request.json")
+    assert status == 200 and "result" not in refused and refused["error"]["code"] == protocol.ERR_INVALID_PARAMS
+    body = copy.deepcopy(fixture("cloud-capability-request.json")["body"])
+    body["params"]["requiredCapabilities"].remove("same_session_continuation")
+    status, answer = listener.call("cloud-capability-request.json", body=body)
     expected = fixture("cloud-capability-result.json")
     assert status == 200 and answer["id"] == expected["id"]
-    assert answer["result"] == {**expected["result"], "runtimeVersion": plugin_module.VERSION}
+    assert answer["result"] == {**expected["result"], "runtimeVersion": plugin_module.VERSION,
+                                "capabilities": body["params"]["requiredCapabilities"]}
     assert server.requests == [] and listener.model.turns == []
 
 
@@ -441,41 +459,53 @@ def test_no_secret_reaches_the_model_tasks_journal_logs_or_answers(listener, ser
 
 # ---- continuation ----
 
-def test_the_continuation_resumes_the_original_context_with_a_new_task_after_input_required(listener, server):
+def test_the_fixture_continuation_after_input_required_is_resume_unavailable_with_no_turn_or_control_call(
+        listener, server, journal_path):
+    # TL ruling: Hermes cannot hold the original session through the model turn (hygiene compression can
+    # rotate it), so a continuation never runs, even with its first generation's session still stored.
     listener.model.behavior[0] = "[INPUT_REQUIRED] Which tone?"
     server.issue(envelope())
     _, first = listener.call("cloud-send-request.json")
     settle(listener, task_of(first)["id"])
     assert server.reports[-1]["outcome"] == "input_wait"
-    continuation = fixture("cloud-continuation-request.json")
-    server.issue(fixture("cloud-continuation-envelope.json"))
-    listener.model.behavior[1] = "block"
-    status, answer = listener.call("cloud-continuation-request.json")
-    task, expected = answer["result"]["task"], fixture("cloud-continuation-response.json")["result"]["task"]
-    assert (task["contextId"], task["status"]["state"], task["metadata"]) == (
-        expected["contextId"], expected["status"]["state"], expected["metadata"])
-    assert task["id"] != task_of(first)["id"]
-    event = listener.model.turns[1]
-    assert (event.source.chat_id, event.source.message_id) == (continuation["body"]["params"]["message"]["contextId"],
-                                                               task["id"])
-    assert server.starts[-1] == fixture("cloud-continuation-start-request.json")
-    wait_for(listener.model.started[1])
-    assert listener.model.session_ids[1] == listener.model.session_ids[0]  # the same Hermes session, resumed
-
-
-def test_a_continuation_after_the_hermes_session_was_reset_is_resume_unavailable(listener, server, journal_path):
-    listener.model.behavior[0] = "[INPUT_REQUIRED] Which tone?"
-    server.issue(envelope())
-    _, first = listener.call("cloud-send-request.json")
-    settle(listener, task_of(first)["id"])
-    listener.sessions.reset_session(listener.adapter._event_session_key(listener.model.turns[0]))  # /new, rollover
     server.issue(fixture("cloud-continuation-envelope.json"))
     before = len(server.requests)
     _, answer = listener.call("cloud-continuation-request.json")
     task = task_of(answer)
     assert task["status"]["state"] == protocol.STATE_REJECTED and "resume_unavailable" in json.dumps(task["status"])
-    assert len(listener.model.turns) == 1 and server.requests[before:] == []  # no start, no fresh-session turn
+    assert len(listener.model.turns) == 1 and server.requests[before:] == []  # no start, bootstrap or report
     assert journaled(journal_path, fixture("cloud-continuation-request.json")["headers"]["x-ab-start-journal-id"]) == []
+
+
+# ---- message.messageId ----
+
+@pytest.mark.parametrize("message_id", [None, "dispatch-1-altered"], ids=["missing", "altered"])
+def test_a_send_whose_message_id_is_not_the_dispatch_id_gets_no_turn_and_no_control_call(listener, server,
+                                                                                         journal_path, message_id):
+    server.issue(envelope())
+    body = copy.deepcopy(SEND["body"])
+    if message_id is None:
+        del body["params"]["message"]["messageId"]
+    else:
+        body["params"]["message"]["messageId"] = message_id
+    _, answer = listener.call("cloud-send-request.json", body=body)
+    task = task_of(answer)
+    assert task["status"]["state"] == protocol.STATE_REJECTED and "message_id_mismatch" in json.dumps(task["status"])
+    assert listener.model.turns == [] and server.requests == [] and journaled(journal_path) == []
+
+
+def test_a_duplicate_send_with_an_altered_message_id_is_refused_without_a_new_turn(listener, server, journal_path):
+    server.issue(envelope())
+    _, first = listener.call("cloud-send-request.json")
+    settle(listener, task_of(first)["id"])
+    before, rows = len(server.requests), journaled(journal_path)
+    body = copy.deepcopy(SEND["body"])
+    body["params"]["message"]["messageId"] = "dispatch-1-altered"
+    _, answer = listener.call("cloud-send-request.json", body=body)
+    task = task_of(answer)
+    assert task["status"]["state"] == protocol.STATE_REJECTED and "message_id_mismatch" in json.dumps(task["status"])
+    assert len(listener.model.turns) == 1 and server.requests[before:] == [] and journaled(journal_path) == rows
+    assert [r["message_id"] for r in rows] == ["dispatch-1"]
 
 
 # ---- identity of an unanswered start, ingress framing ----
@@ -568,7 +598,6 @@ def test_a_finished_task_is_not_cancelable(listener, server):
 
 # ---- restart recovery ----
 
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")  # the crash abandons the turn
 def test_after_a_restart_get_list_and_cancel_recover_by_grant_and_nothing_respawns(listeners, server, journal_path):
     first = listeners()
     first.model.behavior[0] = "block"
@@ -576,29 +605,31 @@ def test_after_a_restart_get_list_and_cancel_recover_by_grant_and_nothing_respaw
     _, sent = first.call("cloud-send-request.json")
     task_id = task_of(sent)["id"]
     wait_for(first.model.started[0])
-    first.crash()  # with the turn in flight
+    first.crash()  # with the turn in flight: its loop stops, its turn records nothing
+    try:
+        second = listeners()
+        assert [r["state"] for r in journaled(journal_path)] == ["uncertain"]
+        # The restarted process holds no agx_: the crash report waits for the server's next request.
+        assert [r["kind"] for r in server.reports] == ["running"]
 
-    second = listeners()
-    assert [r["state"] for r in journaled(journal_path)] == ["uncertain"]
-    # The restarted process holds no agx_: the crash report waits for the server's next request.
-    assert [r["kind"] for r in server.reports] == ["running"]
+        other_agx, other_journal = grant_for(envelope(binding={"assignmentId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000042"}))
+        foreign = {**SEND["headers"], "x-ab-control-credential": other_agx, "x-ab-start-journal-id": other_journal}
+        _, unknown = second.call("cloud-get-task-request.json", headers=foreign,
+                                 body=with_id("cloud-get-task-request.json", task_id))
+        assert unknown["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+        _, listed = second.call("cloud-list-tasks-request.json", headers=foreign)
+        assert listed["result"]["tasks"] == [] and [r["kind"] for r in server.reports] == ["running"]
 
-    other_agx, other_journal = grant_for(envelope(binding={"assignmentId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000042"}))
-    foreign = {**SEND["headers"], "x-ab-control-credential": other_agx, "x-ab-start-journal-id": other_journal}
-    _, unknown = second.call("cloud-get-task-request.json", headers=foreign,
-                             body=with_id("cloud-get-task-request.json", task_id))
-    assert unknown["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
-    _, listed = second.call("cloud-list-tasks-request.json", headers=foreign)
-    assert listed["result"]["tasks"] == [] and [r["kind"] for r in server.reports] == ["running"]
-
-    _, got = second.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task_id))
-    assert (got["result"]["id"], got["result"]["status"]["state"]) == (task_id, protocol.STATE_FAILED)
-    assert got["result"]["metadata"] == sent["result"]["task"]["metadata"]
-    assert server.reports[-1] == report_body(envelope()["binding"], 2, "stopped", "crashed")
-    _, listed = second.call("cloud-list-tasks-request.json")
-    assert [t["id"] for t in listed["result"]["tasks"]] == [task_id]
-    _, canceled = second.call("cloud-cancel-request.json", body=with_id("cloud-cancel-request.json", task_id))
-    assert canceled["error"]["code"] == protocol.ERR_TASK_NOT_CANCELABLE
-    _, resent = second.call("cloud-send-request.json")  # an ambiguous Send's replay never respawns
-    assert task_of(resent)["status"]["state"] == protocol.STATE_FAILED and second.model.turns == []
-    assert len(server.starts) == 1 and len(server.bootstraps) == 1
+        _, got = second.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task_id))
+        assert (got["result"]["id"], got["result"]["status"]["state"]) == (task_id, protocol.STATE_FAILED)
+        assert got["result"]["metadata"] == sent["result"]["task"]["metadata"]
+        assert server.reports[-1] == report_body(envelope()["binding"], 2, "stopped", "crashed")
+        _, listed = second.call("cloud-list-tasks-request.json")
+        assert [t["id"] for t in listed["result"]["tasks"]] == [task_id]
+        _, canceled = second.call("cloud-cancel-request.json", body=with_id("cloud-cancel-request.json", task_id))
+        assert canceled["error"]["code"] == protocol.ERR_TASK_NOT_CANCELABLE
+        _, resent = second.call("cloud-send-request.json")  # an ambiguous Send's replay never respawns
+        assert task_of(resent)["status"]["state"] == protocol.STATE_FAILED and second.model.turns == []
+        assert len(server.starts) == 1 and len(server.bootstraps) == 1
+    finally:  # after the assertions: cancel and await the abandoned turn on the crashed loop, then close it
+        first.stop()

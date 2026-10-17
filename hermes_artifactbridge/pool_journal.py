@@ -46,8 +46,7 @@ CREATE TABLE IF NOT EXISTS dispatches (
     pending_reports TEXT,
     report_refusal TEXT,
     grant_fingerprint TEXT,
-    hermes_session_key TEXT,
-    hermes_session_id TEXT,
+    message_id TEXT,
     PRIMARY KEY (assignment_id, dispatch_id)
 );
 CREATE INDEX IF NOT EXISTS dispatches_dispatch ON dispatches (dispatch_id);
@@ -56,7 +55,7 @@ CREATE INDEX IF NOT EXISTS dispatches_context ON dispatches (context_id);
 CREATE INDEX IF NOT EXISTS dispatches_journal ON dispatches (start_journal_id);
 """
 # Columns added after 0.2.0.dev0's first schema; an existing journal gains them on open.
-_ADDED_COLUMNS = ("pending_reports", "report_refusal", "grant_fingerprint", "hermes_session_key", "hermes_session_id")
+_ADDED_COLUMNS = ("pending_reports", "report_refusal", "grant_fingerprint", "message_id")
 
 
 def _row(raw: sqlite3.Row | None) -> dict | None:
@@ -82,16 +81,18 @@ class Tx:
         return [_row(r) for r in self._conn.execute(f"SELECT * FROM dispatches WHERE {column} = ?", (value,))]
 
     def insert(self, envelope: dict, start_journal_id: str, context_id: str, grant_fingerprint: str,
-               task_id: str) -> dict:
+               task_id: str, message_id: str) -> dict:
         """``task_id`` is the dispatch's one A2A task id, fixed before the first answer so every retry,
-        refusal or lost control response answers the same task."""
+        refusal or lost control response answers the same task. ``message_id`` is the Send's A2A
+        message.messageId (checked equal to the dispatchId), kept with its contextId and task id."""
         binding = envelope["binding"]
         self._conn.execute(
             "INSERT INTO dispatches (assignment_id, dispatch_id, delegation_id, envelope, start_journal_id, state,"
-            " context_id, task_id, updated_at, grant_fingerprint) VALUES (?, ?, ?, ?, ?, 'journaled', ?, ?, ?, ?)",
+            " context_id, task_id, updated_at, grant_fingerprint, message_id)"
+            " VALUES (?, ?, ?, ?, ?, 'journaled', ?, ?, ?, ?, ?)",
             (binding["assignmentId"], envelope["dispatchId"], binding["delegationId"],
              json.dumps(envelope, sort_keys=True, separators=(",", ":")), start_journal_id, context_id, task_id,
-             time.time(), grant_fingerprint))
+             time.time(), grant_fingerprint, message_id))
         return self.get((binding["assignmentId"], envelope["dispatchId"]))
 
     def update(self, key: tuple[str, str], *, from_states: tuple[str, ...], **fields: object) -> bool:

@@ -242,13 +242,11 @@ class PoolCore:
         self._delivery = threading.Lock()
 
     # ---- intercept ----
-    def admit(self, metadata: object, context_id: str, task_id: str, *, grant: Grant,
-              session_of: Callable[[str], str | None]) -> Decision:
+    def admit(self, metadata: object, context_id: str, task_id: str, *, message_id: object, grant: Grant) -> Decision:
         """``context_id`` is the request's A2A contextId ("" when absent); ``task_id`` is the A2A task id a
-        new dispatch is journaled with (a known dispatch keeps its own); ``grant`` is the request's
-        ``(agx_, startJournalId)``; ``session_of`` maps a Hermes session key to its current session id (None
-        when unknown), the proof a continuation's original session still exists. It never waits on a running
-        turn: a retry answers what the journal holds."""
+        new dispatch is journaled with (a known dispatch keeps its own); ``message_id`` is the request's
+        ``message.messageId``, which must be exactly the envelope's dispatchId; ``grant`` is the request's
+        ``(agx_, startJournalId)``. It never waits on a running turn: a retry answers what the journal holds."""
         try:
             envelope = envelope_from_metadata(metadata)
             binding = envelope["binding"]
@@ -256,8 +254,10 @@ class PoolCore:
                 raise Refused("executor_mismatch")
             if grant[1] != start_journal_id(binding["assignmentId"]):
                 raise Refused("journal_mismatch")
+            if message_id != envelope["dispatchId"]:  # missing or altered: no row, no control call, no turn
+                raise Refused("message_id_mismatch")
             with self.journal.tx() as tx:
-                row = self._journal_dispatch(tx, envelope, context_id, grant, task_id, session_of)
+                row = self._journal_dispatch(tx, envelope, context_id, grant, task_id)
             self._hold(grant)
         except Refused as refused:
             logger.info("artifactbridge pooled dispatch refused: %s", refused.code)
@@ -293,8 +293,7 @@ class PoolCore:
             return self._grants.get(start_journal)
 
     @staticmethod
-    def _journal_dispatch(tx: Tx, envelope: dict, context_id: str, grant: Grant, task_id: str,
-                          session_of: Callable[[str], str | None]) -> dict:
+    def _journal_dispatch(tx: Tx, envelope: dict, context_id: str, grant: Grant, task_id: str) -> dict:
         if any(row["envelope"] != envelope for row in tx.where("dispatch_id", envelope["dispatchId"])):
             raise Refused("tuple_mismatch")  # the first journaled envelope (startBy included) is immutable
         row = tx.get(_key(envelope))
@@ -310,22 +309,13 @@ class PoolCore:
         delegation_id, generation = envelope["binding"]["delegationId"], envelope["binding"]["executionGeneration"]
         if context_id and any(r["delegation_id"] != delegation_id for r in tx.where("context_id", context_id)):
             raise Refused("context_bound_to_other_delegation")
-        prior = tx.where("delegation_id", delegation_id)
-        # A known delegation resumes only on its original context, from the retained input wait of its latest
-        # earlier generation, in the very Hermes session that wait ended in (still the current session for its
-        # key: not reset, rolled over or lost); otherwise resume_unavailable, never a fresh session.
-        # ponytail: Hermes can still roll the session over (idle/daily reset) between this check and the turn;
-        # closing that needs a reset-free Hermes session lookup.
-        if (prior and context_id != prior[0]["context_id"]) or (not prior and generation > 1):
+        # Fail closed: every continuation (a later generation, or a delegation already journaled) is
+        # resume_unavailable, never started fresh. Hermes 0.22.2 cannot hold the original session through
+        # model invocation (hygiene compression can rotate it), so same_session_continuation is not claimed.
+        if generation > 1 or tx.where("delegation_id", delegation_id):
             raise Refused("resume_unavailable")
-        if prior:
-            latest = max(prior, key=lambda r: r["envelope"]["binding"]["executionGeneration"])
-            if (latest["envelope"]["binding"]["executionGeneration"] >= generation or latest["state"] != "finished"
-                    or latest["result_state"] != INPUT_REQUIRED or not latest["hermes_session_id"]
-                    or session_of(latest["hermes_session_key"]) != latest["hermes_session_id"]):
-                raise Refused("resume_unavailable")
         return tx.insert(envelope, grant[1], context_id or "ctx-" + uuid.uuid4().hex[:16], _fingerprint(grant[0]),
-                         task_id)
+                         task_id, envelope["dispatchId"])  # admit checked message.messageId == dispatchId
 
     def _advance(self, row: dict) -> Decision:
         task_id = row["task_id"]
@@ -422,19 +412,17 @@ class PoolCore:
             self.deliver_reports()
         return running
 
-    def finish(self, task_id: str, outcome: str, text: str, session: tuple[str, str | None] = ("", None)) -> None:
+    def finish(self, task_id: str, outcome: str, text: str) -> None:
         """Record a turn's result on its OWN row only; a row already canceled (or replaced) stays as it is
-        and gets no further report. ``session`` is the Hermes (session key, session id) the turn ended in,
-        which a continuation must find current."""
-        self._end(task_id, outcome, text, kind="stopped", session=session)
+        and gets no further report."""
+        self._end(task_id, outcome, text, kind="stopped")
 
     def cancel(self, task_id: str) -> bool:
         """A confirmed stop of a live pooled turn: cancel_acknowledged with its own binding; drops its
         credential. Called only once the runtime confirmed the cancellation."""
         return self._end(task_id, CANCELED, "", kind="cancel_acknowledged")
 
-    def _end(self, task_id: str, outcome: str, text: str, *, kind: str, refusal: str | None = None,
-             session: tuple[str, str | None] = ("", None)) -> bool:
+    def _end(self, task_id: str, outcome: str, text: str, *, kind: str, refusal: str | None = None) -> bool:
         """``refusal`` ends a permitted, never-spawned row as refused; it still reports, as it held a permit."""
         with self._lock:
             key = self._live.get(task_id)
@@ -445,8 +433,7 @@ class PoolCore:
                 ended = tx.update(key, from_states=("permitted",), state="refused", refusal=refusal)
             else:
                 ended = tx.update(key, from_states=("permitted", "spawned", "running"), state="finished",
-                                  result_state=outcome, result_text=text, hermes_session_key=session[0],
-                                  hermes_session_id=session[1])
+                                  result_state=outcome, result_text=text)
             if ended:
                 tx.enqueue_report(key, kind, _REPORT_OUTCOME[outcome])
             row = tx.get(key)

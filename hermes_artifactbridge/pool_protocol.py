@@ -40,12 +40,13 @@ _AGX_RE = re.compile(r"^agx_[A-Za-z0-9_-]{32,}$")
 _JOURNAL_RE = re.compile(r"^[\x20-\x7e]{1,128}$")  # printable ASCII, no control characters
 
 # Only what this plugin implements; the proof is separate from open-pool consent, which the plugin never
-# claims or sets.
+# claims or sets. ``same_session_continuation`` is deliberately absent: Hermes 0.22.2 cannot guarantee the
+# original session through model invocation (hygiene compression can rotate it), so every continuation is
+# refused ``resume_unavailable`` and a probe requiring the full cloud set is refused (an ineligible runner).
 IMPLEMENTED_CAPABILITIES = (
     "assignment_tuple_start_ownership",
     "scoped_space_document_skill",
     "per_task_credentials_fresh_sessions",
-    "same_session_continuation",
     "durable_inspect_recovery",
     "cancel_report_fencing",
     "cloud_start_headers_v1",
@@ -107,7 +108,8 @@ def validate_envelope(envelope: object) -> dict:
         raise Refused("unsupported_protocol_version")
     validate_binding(envelope["binding"])
     if not (isinstance(envelope["dispatchId"], str) and envelope["dispatchId"]
-            and _positive_int(envelope["commandSequence"]) and _positive_int(envelope["setupRevision"])):
+            and type(envelope["commandSequence"]) is int and envelope["commandSequence"] == 1  # the literal 1
+            and _positive_int(envelope["setupRevision"])):
         raise Refused("invalid_envelope")
     parse_start_by(envelope["startBy"])
     return envelope

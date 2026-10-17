@@ -58,18 +58,15 @@ def core(make_core):
     return make_core()
 
 
-# The Hermes (session key, session id) a first generation ended in; the helper's Hermes still has it current.
-SESSION = ("agent:main:artifactbridge-pool:dm:" + CTX, "20261017_110000_abcdef12")
-
-
-def admit(core, metadata, context_id, task_id, *, session_of=dict([SESSION]).get, **kwargs):
-    """``core.admit`` with the start headers the server sends for the metadata's assignment."""
+def admit(core, metadata, context_id, task_id, **kwargs):
+    """``core.admit`` with the start headers and ``message.messageId`` (= dispatchId) the server sends for the
+    metadata's assignment."""
     env = metadata.get(pool_protocol.METADATA_KEY) if isinstance(metadata, dict) else None
     try:
-        grant = grant_for(env)
+        grant, message_id = grant_for(env), env["dispatchId"]
     except (TypeError, KeyError, AttributeError):
-        grant = grant_for(envelope())
-    return core.admit(metadata, context_id, task_id, grant=grant, session_of=session_of, **kwargs)
+        grant, message_id = grant_for(envelope()), envelope()["dispatchId"]
+    return core.admit(metadata, context_id, task_id, **{"grant": grant, "message_id": message_id, **kwargs})
 
 
 def rows(path):
@@ -125,9 +122,17 @@ def test_every_fixture_parses_through_the_plugins_own_parsers():
     assert credential == fixture("bootstrap-response.json")["credential"] and expires_at.isoformat() == "2026-10-17T11:15:00+00:00"
     capability = fixture("cloud-capability-request.json")["body"]
     assert capability["method"] == p.CAPABILITY_METHOD
-    assert p.capability_answer(capability["params"], executor_id=EXECUTOR_ID, connection_revision=REVISION,
-                               runtime_version="0.0.0-fixture") == fixture("cloud-capability-result.json")["result"]
-    assert list(IMPLEMENTED_CAPABILITIES) == capability["params"]["requiredCapabilities"]
+    # TL ruling: the full cloud set includes same_session_continuation, which this runner does not implement,
+    # so the fixture probe is refused (a deliberately ineligible runner); the supported subset is echoed.
+    with pytest.raises(Refused, match="capability_mismatch"):
+        p.capability_answer(capability["params"], executor_id=EXECUTOR_ID, connection_revision=REVISION,
+                            runtime_version="0.0.0-fixture")
+    result = fixture("cloud-capability-result.json")["result"]
+    full = capability["params"]["requiredCapabilities"]
+    assert [c for c in full if c != "same_session_continuation"] == list(IMPLEMENTED_CAPABILITIES)
+    subset = {**capability["params"], "requiredCapabilities": list(IMPLEMENTED_CAPABILITIES)}
+    assert p.capability_answer(subset, executor_id=EXECUTOR_ID, connection_revision=REVISION,
+                               runtime_version="0.0.0-fixture") == {**result, "capabilities": list(IMPLEMENTED_CAPABILITIES)}
     # Legacy (integration-u3-r1) shapes, still generated: the same tuple; report shapes are unchanged.
     legacy = envelope_from_metadata(fixture("dispatch-metadata.json"))
     assert legacy == env == validate_envelope(fixture("mailbox-assignment-command.json")["envelope"])
@@ -203,6 +208,45 @@ def test_malformed_metadata_is_rejected_before_journal_or_network(core, server, 
     decision = admit(core, metadata, CTX, "task-1")
     assert (decision.kind, decision.outcome) == ("terminal", REJECTED) and code in decision.text
     assert rows(journal_path) == [] and server.requests == []
+
+
+@pytest.mark.parametrize("sequence", [2, 3, True, 1.0, "1"])
+def test_an_assignment_or_permit_whose_command_sequence_is_not_the_literal_1_is_refused(core, server, journal_path,
+                                                                                         sequence):
+    decision = admit(core, server.issue(envelope(commandSequence=sequence)), CTX, "task-1")
+    assert decision.outcome == REJECTED and "invalid_envelope" in decision.text
+    assert rows(journal_path) == [] and server.requests == []
+    permit = {**fixture("cloud-start-replay-permit.json")["permit"], "commandSequence": sequence}
+    assert pool_protocol.parse_start_response({"outcome": "permit", "permit": permit}) is None
+
+
+def test_the_sequence_2_mailbox_tombstone_parses_as_its_own_shape_and_is_never_admitted(core, journal_path):
+    tombstone = fixture("mailbox-withdrawn-tombstone.json")
+    assert tombstone["commandSequence"] == 2 and validate_binding(tombstone["binding"]) == envelope()["binding"]
+    assert validate_envelope({**envelope(), "commandSequence": 1}) == envelope()
+    as_assignment = {k: v for k, v in {**envelope(), **tombstone}.items() if k != "kind"}
+    decision = admit(core, fake_pool.metadata(as_assignment), CTX, "task-1")
+    assert decision.outcome == REJECTED and "invalid_envelope" in decision.text and rows(journal_path) == []
+
+
+@pytest.mark.parametrize("message_id", [None, "", "dispatch-2", "DISPATCH-1", " dispatch-1", 1])
+def test_a_send_whose_message_id_is_not_exactly_the_dispatch_id_is_refused_before_any_control_call(
+        core, server, journal_path, message_id):
+    decision = admit(core, server.issue(envelope()), CTX, "task-1", message_id=message_id)
+    assert decision.outcome == REJECTED and "message_id_mismatch" in decision.text
+    assert rows(journal_path) == [] and server.requests == []
+
+
+def test_the_message_id_is_journaled_with_the_context_and_task_and_an_altered_duplicate_is_refused(
+        core, server, journal_path):
+    metadata = server.issue(envelope())
+    admit(core, metadata, CTX, "task-1")
+    [row] = rows(journal_path)
+    assert (row["message_id"], row["context_id"], row["task_id"]) == ("dispatch-1", CTX, "task-1")
+    before = len(server.requests)
+    decision = admit(core, metadata, CTX, "task-2", message_id="dispatch-1-altered")
+    assert decision.outcome == REJECTED and "message_id_mismatch" in decision.text
+    assert len(server.requests) == before and rows(journal_path) == [row]
 
 
 @pytest.mark.parametrize("binding", [{"executorId": uid(99)}, {"executorConnectionRevision": "2"}])
@@ -419,15 +463,16 @@ def test_an_unrelated_task_without_context_gets_a_fresh_session(core, server):
     assert decision.kind == "spawn" and decision.context_id.startswith("ctx-")
 
 
-def test_continuation_resumes_only_on_the_original_context(core, server, journal_path):
+@pytest.mark.parametrize("context_id", [CTX, "ctx-elsewhere", ""])
+def test_a_continuation_after_an_input_wait_is_resume_unavailable_on_any_context(core, server, journal_path,
+                                                                                 context_id):
+    # TL ruling: Hermes cannot hold the original session through the model turn, so no continuation runs.
     admit(core, server.issue(envelope()), CTX, "task-1")
-    core.finish("task-1", INPUT_REQUIRED, "need more", SESSION)
-    moved = admit(core, server.issue(continuation(40)), "ctx-elsewhere", "task-2")
-    assert moved.outcome == REJECTED and "resume_unavailable" in moved.text
-    fresh = admit(core, server.issue(continuation(41, dispatch="dispatch-3")), "", "task-3")
-    assert fresh.outcome == REJECTED and "resume_unavailable" in fresh.text
-    resumed = admit(core, server.issue(continuation(42, dispatch="dispatch-4")), CTX, "task-4")
-    assert (resumed.kind, resumed.context_id) == ("spawn", CTX)
+    core.finish("task-1", INPUT_REQUIRED, "need more")
+    before = len(server.requests)
+    decision = admit(core, server.issue(continuation(42)), context_id, "task-2")
+    assert (decision.kind, decision.outcome) == ("terminal", REJECTED) and "resume_unavailable" in decision.text
+    assert len(server.requests) == before and len(rows(journal_path)) == 1  # no start, bootstrap or new row
 
 
 def test_a_continuation_for_a_session_unknown_to_the_journal_is_resume_unavailable(core, server, journal_path):
@@ -436,35 +481,19 @@ def test_a_continuation_for_a_session_unknown_to_the_journal_is_resume_unavailab
     assert rows(journal_path) == [] and server.requests == []
 
 
-def test_the_fixture_continuation_resumes_the_input_wait_with_its_own_grant_and_journal(core, server, journal_path):
+def test_the_fixture_continuation_with_its_own_grant_is_resume_unavailable_before_any_control_call(core, server,
+                                                                                                   journal_path):
     context_id = fixture("cloud-send-request.json")["body"]["params"]["message"]["contextId"]
     admit(core, server.issue(envelope()), context_id, "task-1")
-    core.finish("task-1", INPUT_REQUIRED, "which tone?", SESSION)
+    core.finish("task-1", INPUT_REQUIRED, "which tone?")
     request = fixture("cloud-continuation-request.json")
-    cont = envelope_from_metadata(request["body"]["params"]["metadata"])
+    params = request["body"]["params"]
     grant = (request["headers"]["x-ab-control-credential"], request["headers"]["x-ab-start-journal-id"])
-    decision = core.admit(server.issue(cont), request["body"]["params"]["message"]["contextId"], "task-2", grant=grant,
-                          session_of=dict([SESSION]).get)
-    assert (decision.kind, decision.context_id) == ("spawn", context_id)
-    assert server.starts[-1] == fixture("cloud-continuation-start-request.json")
-    assert server.bootstraps[-1] == fixture("cloud-continuation-bootstrap-request.json")
-    # Each generation is authorized by its own agx_ only: the first grant can no longer start it.
-    assert {r["authorization"] for r in server.requests[-2:]} == {f"Bearer {grant[0]}"}
-
-
-@pytest.mark.parametrize("current, recorded", [
-    ("20261017_120000_rolled00", SESSION),  # Hermes reset or rolled the session over: a new session id
-    (None, SESSION),                        # the session is gone from Hermes (another home, store lost)
-    (SESSION[1], ("", None)),               # the input wait ended with no Hermes session recorded
-])
-def test_a_continuation_whose_original_hermes_session_is_not_current_is_resume_unavailable(core, server, journal_path,
-                                                                                          current, recorded):
-    admit(core, server.issue(envelope()), CTX, "task-1")
-    core.finish("task-1", INPUT_REQUIRED, "need more", recorded)
     before = len(server.requests)
-    decision = admit(core, server.issue(continuation(42)), CTX, "task-2", session_of={SESSION[0]: current}.get)
+    decision = core.admit(server.issue(envelope_from_metadata(params["metadata"])), params["message"]["contextId"],
+                          "task-2", grant=grant, message_id=params["message"]["messageId"])
     assert decision.outcome == REJECTED and "resume_unavailable" in decision.text
-    assert len(server.requests) == before and len(rows(journal_path)) == 1  # no start, no fresh-session row
+    assert len(server.requests) == before and len(rows(journal_path)) == 1
 
 
 @pytest.mark.parametrize("first_outcome", [COMPLETED, FAILED, None])
@@ -483,7 +512,7 @@ def test_a_continuation_without_a_retained_input_wait_is_resume_unavailable(core
 def test_a_grant_naming_another_assignments_journal_is_refused_before_the_journal(core, server, journal_path):
     metadata = server.issue(envelope())
     agx, _ = grant_for(envelope())
-    decision = core.admit(metadata, CTX, "task-1", grant=(agx, grant_for(continuation(42))[1]), session_of=dict().get)
+    decision = core.admit(metadata, CTX, "task-1", grant=(agx, grant_for(continuation(42))[1]), message_id="dispatch-1")
     assert decision.outcome == REJECTED and "journal_mismatch" in decision.text
     assert rows(journal_path) == [] and server.requests == []
 
@@ -493,7 +522,7 @@ def test_a_journaled_assignment_presented_with_another_agx_is_refused_and_never_
     agx, journal = grant_for(envelope())
     admit(core, metadata, CTX, "task-1")
     before = len(server.requests)
-    decision = core.admit(metadata, CTX, "task-2", grant=("agx_" + "Z" * 43, journal), session_of=dict().get)
+    decision = core.admit(metadata, CTX, "task-2", grant=("agx_" + "Z" * 43, journal), message_id="dispatch-1")
     assert decision.outcome == REJECTED and "grant_mismatch" in decision.text and len(server.requests) == before
     assert rows(journal_path)[0]["grant_fingerprint"] == hashlib.sha256(agx.encode()).hexdigest()
 
@@ -749,8 +778,7 @@ def test_an_existing_journal_gains_the_report_columns_and_keeps_its_rows(make_co
     metadata = server.issue(envelope())
     assert admit(make_core(), metadata, CTX, "task-1").kind == "spawn"
     with sqlite3.connect(journal_path) as conn:  # the first 0.2.0.dev0 schema had none of these columns
-        for column in ("pending_reports", "report_refusal", "grant_fingerprint", "hermes_session_key",
-                       "hermes_session_id"):
+        for column in ("pending_reports", "report_refusal", "grant_fingerprint", "message_id"):
             conn.execute(f"ALTER TABLE dispatches DROP COLUMN {column}")
     make_core()  # opening twice must not re-add a column
     restarted = make_core()
@@ -792,8 +820,8 @@ def test_a_refused_or_unauthorized_start_is_terminal_and_never_retried(make_core
         grant, code = ("agx_" + "W" * 40, grant_for(envelope())[1]), "unauthorized"
     core = make_core()
     metadata = server.issue(envelope())
-    assert code in core.admit(metadata, CTX, "task-1", grant=grant, session_of=dict().get).text
-    assert code in core.admit(metadata, CTX, "task-2", grant=grant, session_of=dict().get).text
+    assert code in core.admit(metadata, CTX, "task-1", grant=grant, message_id="dispatch-1").text
+    assert code in core.admit(metadata, CTX, "task-2", grant=grant, message_id="dispatch-1").text
     assert len(server.requests) == 1 and server.bootstraps == []
     assert [(r["state"], r["refusal"]) for r in rows(journal_path)] == [("refused", code)]
     assert "agx_" not in caplog.text
