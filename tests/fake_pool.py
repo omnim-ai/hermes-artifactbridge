@@ -1,26 +1,23 @@
 """In-process fake of the ArtifactBridge pooled control routes (src/routes/agent-gateway-pool.ts at
-artifact-forge c0b4de56c), answering with the integration-u3-r1 fixture statuses and bodies.
+artifact-forge a26eb977c), answering with the cloud-contract-r2 fixture statuses and bodies.
 
-- 401 ``unauthorized-response.json`` for a missing or unknown ``agx_``; 400 ``invalid_request`` for a body
-  that is not the strict protocol v1 shape; 409 ``scheduler-busy-response.json`` (retryable) or a named
-  refusal (``refusal-response.json`` shape).
-- Start follows ``decidePooledStart``: unknown assignment ``start_not_authorized``, a tuple or dispatch
-  mismatch, another journal ``start_owned``, a passed startBy before spawn, then the permit for the same
-  journal. Scaffolding mode (default): the first journal owns an unstarted assignment. Cloud mode
-  (``cloud=True``): the server lifecycle owns start, so an assignment it did not start is
-  ``start_not_authorized`` and one it started under its own journal is ``start_owned``.
+- Every route authenticates with the ``agx_`` of the assignment its body names (``Bearer`` of the start
+  headers' ``X-AB-Control-Credential``): 401 ``unauthorized-response.json`` for a missing, unknown or other
+  assignment's ``agx_``; 400 ``invalid_request`` for a body that is not the strict protocol v1 shape; 409
+  ``scheduler-busy-response.json`` (retryable) or a named refusal (``refusal-response.json`` shape).
+- ``issue`` is the server lifecycle starting cloud work: it mints the assignment's ``agx_`` and records the
+  journal ``agj_`` + assignmentId without hyphens. Start follows ``decidePooledStart``: unknown assignment
+  ``start_not_authorized``, a tuple or dispatch mismatch, another journal ``start_owned``, a passed startBy
+  before spawn, then the replay permit for that journal.
 - Bootstrap needs the start journal; a retry mints a fresh ``dlc_`` and revokes the earlier one.
 - Report is idempotent by reportSequence (recorded true, then false on a replay); ``currentOccupant`` is
   false for a superseded assignment.
-- Capability: GET derives the nonce from the credential hash, executor and revision; POST verifies like
-  ``verifyPooledCapabilityProof`` and never touches open-pool consent.
 """
 from __future__ import annotations
 
 import copy
 import hashlib
 import json
-import re
 import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -33,9 +30,7 @@ import httpx2
 START_PATH = "/api/agent-gateway/pool/start"
 BOOTSTRAP_PATH = "/api/agent-gateway/pool/bootstrap"
 REPORT_PATH = "/api/agent-gateway/pool/report"
-CAPABILITY_PATH = "/api/agent-gateway/pool/capability"
-FIXTURES = Path(__file__).parent / "fixtures" / "pooled_v1"
-EXECUTOR_CREDENTIAL = "agx_test_executor_credential_do_not_leak"
+FIXTURES = Path(__file__).parent / "fixtures" / "cloud_r2"
 ORIGIN = "https://ab.test"
 TOOLS_URL = ORIGIN + "/mcp/agent-gateway"
 
@@ -46,7 +41,7 @@ def fixture(name: str) -> dict:
 
 def envelope(**changes) -> dict:
     """The dispatch-metadata fixture's envelope; ``binding`` changes merge into the binding."""
-    env = copy.deepcopy(fixture("dispatch-metadata.json")["artifactbridge.assignment"])
+    env = copy.deepcopy(fixture("cloud-send-request.json")["body"]["params"]["metadata"]["artifactbridge.assignment"])
     env["binding"].update(changes.pop("binding", {}))
     env.update(changes)
     return env
@@ -61,9 +56,20 @@ REVISION = envelope()["binding"]["executorConnectionRevision"]
 # The fixture's startBy minus ten minutes: a clock where the fixtures are still startable.
 BEFORE_START_BY = datetime(2026, 10, 17, 11, 50, tzinfo=timezone.utc)
 BINDING_KEYS = set(envelope()["binding"])
-REQUIRED_CAPABILITIES = fixture("capability-challenge.json")["requiredCapabilities"]
-_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
-_REVISION = re.compile(r"^[1-9][0-9]{0,18}$")
+# The fixtures' agx_ for their two assignments (cloud-send-request.json, cloud-continuation-request.json).
+_FIXTURE_GRANTS = {
+    fixture(name)["body"]["params"]["metadata"]["artifactbridge.assignment"]["binding"]["assignmentId"]:
+        fixture(name)["headers"]["x-ab-control-credential"]
+    for name in ("cloud-send-request.json", "cloud-continuation-request.json")}
+
+
+def grant_for(env: dict) -> tuple[str, str]:
+    """``(agx_, startJournalId)`` the server presents for ``env``'s assignment."""
+    aid = env["binding"]["assignmentId"]
+    agx = _FIXTURE_GRANTS.get(aid) or "agx_" + hashlib.sha256(aid.encode()).hexdigest()[:43]
+    return agx, "agj_" + aid.replace("-", "")
+
+
 _REPORT_KINDS = {"running", "stopped", "cancel_acknowledged"}
 _REPORT_OUTCOMES = {"completed", "input_wait", "failed", "canceled", "timed_out", "crashed", None}
 
@@ -87,14 +93,9 @@ def _start_refusal(reason: str) -> httpx2.Response:
     return httpx2.Response(409, json={"outcome": "refused", "reason": reason})
 
 
-def _sha256(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()
-
-
 @dataclass
 class FakeControl:
     clock: Clock
-    cloud: bool = False
     assignments: dict[str, dict] = field(default_factory=dict)  # assignmentId -> the dispatched envelope
     journals: dict[str, str] = field(default_factory=dict)  # assignmentId -> start journal
     live: dict[str, str] = field(default_factory=dict)  # assignmentId -> its one live dlc_
@@ -106,8 +107,6 @@ class FakeControl:
     bootstraps: list[dict] = field(default_factory=list)
     reports: list[dict] = field(default_factory=list)  # recorded reports only
     replays: list[dict] = field(default_factory=list)  # reports answered recorded:false
-    proofs: list[dict] = field(default_factory=list)
-    capability_revision: int = 0
     requests: list[dict] = field(default_factory=list)  # every request, before any fault
     # path -> queue of faults, one per request: "busy" (409 scheduler_busy, nothing changed), "down" (503,
     # nothing changed), "lost" (processed, then the response is lost).
@@ -120,8 +119,10 @@ class FakeControl:
     on_bootstrap: Callable[[dict], None] | None = None  # after the dlc_ is minted, before the response
 
     def issue(self, env: dict) -> dict:
-        """Dispatch ``env`` server-side; returns the A2A request metadata carrying it."""
-        self.assignments[env["binding"]["assignmentId"]] = copy.deepcopy(env)
+        """Start ``env`` server-side under its journal; returns the A2A request metadata carrying it."""
+        aid = env["binding"]["assignmentId"]
+        self.assignments[aid] = copy.deepcopy(env)
+        self.journals.setdefault(aid, grant_for(env)[1])
         return metadata(env)
 
     def transport(self) -> httpx2.MockTransport:
@@ -136,7 +137,12 @@ class FakeControl:
                               "authorization": request.headers.get("authorization"),
                               "delegation_token": request.headers.get("x-artifactbridge-delegation-token"),
                               "body": json.loads(request.content) if request.content else None})
-        if request.headers.get("authorization") != f"Bearer {EXECUTOR_CREDENTIAL}":
+        try:
+            body = json.loads(request.content)
+            env = self.assignments[body["binding"]["assignmentId"]]
+        except (ValueError, KeyError, TypeError):
+            env = None
+        if env is None or request.headers.get("authorization") != f"Bearer {grant_for(env)[0]}":
             return httpx2.Response(401, json=fixture("unauthorized-response.json"))
         if self.redirect:
             return httpx2.Response(307, headers={"location": "https://elsewhere.test/steal"})
@@ -145,18 +151,10 @@ class FakeControl:
             return httpx2.Response(409, json=fixture("scheduler-busy-response.json"))
         if fault == "down":
             return httpx2.Response(503)
-        if request.method == "GET":
-            response = self._challenge(dict(request.url.params)) if path == CAPABILITY_PATH else httpx2.Response(404)
-        else:
-            try:
-                body = json.loads(request.content)
-            except ValueError:
-                return _error(400, "invalid_request", "Body must be a protocol version 1 request.")
-            if path in self.refuse:
-                return _error(409, self.refuse[path])
-            handler = {START_PATH: self._start, BOOTSTRAP_PATH: self._bootstrap, REPORT_PATH: self._report,
-                       CAPABILITY_PATH: lambda b: self._prove(b, dict(request.url.params))}.get(path)
-            response = handler(body) if handler else httpx2.Response(404)
+        if path in self.refuse:
+            return _error(409, self.refuse[path])
+        handler = {START_PATH: self._start, BOOTSTRAP_PATH: self._bootstrap, REPORT_PATH: self._report}.get(path)
+        response = handler(body) if handler and request.method == "POST" else httpx2.Response(404)
         if fault == "lost":
             raise httpx2.ReadError("response lost")
         return response
@@ -187,10 +185,8 @@ class FakeControl:
             return _start_refusal("start_owned")
         if aid not in self.last_sequence and self.clock() >= datetime.fromisoformat(env["startBy"]):
             return httpx2.Response(409, json=fixture("start-deadline-refusal.json"))
-        if journal is None:
-            if self.cloud:  # the server lifecycle starts cloud work; an executor never claims it
-                return _start_refusal("start_not_authorized")
-            self.journals[aid] = body["startJournalId"]
+        if journal is None:  # the server lifecycle starts cloud work; an executor never claims it
+            return _start_refusal("start_not_authorized")
         permit = {**env, "startJournalId": self.journals[aid], **(self.tamper_permit or {})}
         return httpx2.Response(200, json={"outcome": "permit", "permit": permit})
 
@@ -227,36 +223,3 @@ class FakeControl:
             self.last_sequence[aid] = sequence
         (self.reports if recorded else self.replays).append(body)
         return httpx2.Response(200, json={"recorded": recorded, "currentOccupant": aid not in self.superseded})
-
-    def _nonce(self, executor_id: str, revision: str) -> str:
-        return _sha256("\n".join(["ab-pool-capability-v1", _sha256(EXECUTOR_CREDENTIAL), executor_id, revision]))
-
-    def _challenge(self, query: dict) -> httpx2.Response:
-        if not (_UUID.match(query.get("workspaceId", "")) and _UUID.match(query.get("executorId", ""))
-                and _REVISION.match(query.get("executorConnectionRevision", ""))):
-            return _error(400, "invalid_request", "workspaceId, executorId and executorConnectionRevision are required.")
-        executor_id, revision = query["executorId"], query["executorConnectionRevision"]
-        return httpx2.Response(200, json={"protocolVersion": 1, "executorId": executor_id,
-                                          "executorConnectionRevision": revision,
-                                          "nonce": self._nonce(executor_id, revision),
-                                          "requiredCapabilities": list(REQUIRED_CAPABILITIES)})
-
-    def _prove(self, proof: dict, query: dict) -> httpx2.Response:
-        executor_id, revision = proof.get("executorId"), proof.get("executorConnectionRevision")
-        if not (_UUID.match(query.get("workspaceId", "")) and isinstance(executor_id, str) and _UUID.match(executor_id)
-                and isinstance(revision, str) and _REVISION.match(revision) and proof.get("protocolVersion") == 1):
-            return _error(400, "invalid_request", "Body must be a protocol version 1 capability proof with ?workspaceId.")
-        self.proofs.append(proof)
-        capabilities = proof.get("capabilities")
-        if set(proof) != set(fixture("capability-proof.json")) or not isinstance(capabilities, list):
-            reason = "proof_invalid"
-        elif proof["nonce"] != self._nonce(executor_id, revision):
-            reason = "challenge_mismatch"
-        elif not set(REQUIRED_CAPABILITIES) <= set(capabilities):
-            reason = "missing_capability"
-        else:
-            self.capability_revision += 1
-            return httpx2.Response(200, json={"eligibility": "pool_capable",
-                                              "capabilityRevision": str(self.capability_revision),
-                                              "executorConnectionRevision": revision})
-        return httpx2.Response(409, json={"eligibility": "own_agent_only", "reason": reason})

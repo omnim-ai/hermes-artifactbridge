@@ -9,6 +9,7 @@ to the configured ArtifactBridge origin.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -110,8 +111,9 @@ class ScopedTools:
 class PooledTools:
     """Token-free scoped tools for pooled sessions. Each call presents only the ``dlc_`` bound to the
     current (artifactbridge-pool, contextId, task id) session: no binding is a refusal, never a fallback to
-    a dlt_, a service credential or personal access. Expiry is returned as-is: no dlt_ renewal applies and
-    bootstrap refresh is out of scope."""
+    a dlt_, a service credential or personal access. No dlt_ renewal applies: a ``dlc_`` near its expiresAt
+    is re-bootstrapped by the lookup, and a ``credential_expired`` denial is re-bootstrapped and retried
+    exactly once (never ``access_revoked`` or a canceled task)."""
 
     def __init__(self, *, tools_url: str, credentials: CredentialBindings, http_factory: HttpFactory = default_http_factory):
         self.tools_url = tools_url
@@ -130,14 +132,22 @@ class PooledTools:
 
     async def invoke(self, name: str, args: dict) -> dict:
         platform, context_id, task_id = session_route()
-        credential = self._credentials.lookup(platform, context_id, task_id) if platform == POOL_PLATFORM else None
+        credential = (await asyncio.to_thread(self._credentials.lookup, platform, context_id, task_id)
+                      if platform == POOL_PLATFORM else None)
         if credential is None:
             return refusal("pooled_credential_unavailable")
         wire = POOL_WIRE_NAMES[name]
         args = {k: v for k, v in (args or {}).items() if k != TOKEN_ARG}
         payload, preserve = _payload(wire, args)
         try:
-            return await call_scoped_tool(self.tools_url, {"authorization": f"Bearer {credential}"}, wire, payload,
+            result = await call_scoped_tool(self.tools_url, {"authorization": f"Bearer {credential}"}, wire, payload,
+                                            http_factory=self._http_factory, preserve=preserve)
+            if result.get("error") != RENEWABLE_CODE:
+                return result
+            renewed = await asyncio.to_thread(self._credentials.refresh, platform, context_id, task_id, credential)
+            if renewed is None:
+                return result
+            return await call_scoped_tool(self.tools_url, {"authorization": f"Bearer {renewed}"}, wire, payload,
                                           http_factory=self._http_factory, preserve=preserve)
         except Exception as exc:
             logger.warning("artifactbridge pooled scoped call failed: %s %s", wire, type(exc).__name__)

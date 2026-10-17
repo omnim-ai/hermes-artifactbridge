@@ -1,23 +1,30 @@
-"""Pooled execution protocol v1: the assignment tuple, the dispatch envelope, and the capability proof.
+"""Pooled execution protocol v1: the assignment tuple, the dispatch envelope, the cloud start headers and
+the capability answer.
 
-Shapes follow the ArtifactBridge integration-u3-r1 fixtures (tests/fixtures/pooled_v1). Every object is
+Shapes follow the ArtifactBridge cloud-contract-r2 fixtures (tests/fixtures/cloud_r2). Every object is
 strict: an unknown or missing key is a refusal, never a best-effort parse. The dispatch metadata never
-carries a ``dlt_`` token; this module never accepts one.
+carries a ``dlt_`` token or any credential; this module never accepts one there.
 """
 from __future__ import annotations
 
 import re
 from datetime import datetime
+from typing import Callable
 
 PROTOCOL_VERSION = 1
 METADATA_KEY = "artifactbridge.assignment"
 
-# The cloud control routes of artifact-forge src/routes/agent-gateway-pool.ts (c0b4de56c; not yet merged or
-# deployed): same origin as the configured tools URL, Bearer agx_ executor control credential.
+# The control routes of artifact-forge src/routes/agent-gateway-pool.ts (a26eb977c; not yet merged or
+# deployed): same origin as the configured tools URL, Bearer <the assignment's agx_ from the start headers>.
 START_PATH = "/api/agent-gateway/pool/start"
 BOOTSTRAP_PATH = "/api/agent-gateway/pool/bootstrap"
 REPORT_PATH = "/api/agent-gateway/pool/report"
-CAPABILITY_PATH = "/api/agent-gateway/pool/capability"  # GET the challenge, POST the proof
+# The JSON-RPC method the server's capability probe calls on this listener (cloud-capability-request.json).
+CAPABILITY_METHOD = "artifactbridge/pool/capability"
+# Request-scoped start headers on every pooled Send/Get/List/Cancel (cloud-send-request.json).
+CREDENTIAL_HEADER = "X-AB-Control-Credential"
+JOURNAL_HEADER = "X-AB-Start-Journal-Id"
+PROTOCOL_HEADER = "X-AB-Pool-Protocol-Version"
 
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _BIGINT_RE = re.compile(r"^[1-9][0-9]*$")
@@ -30,7 +37,7 @@ ENVELOPE_KEYS = frozenset({"protocolVersion", "binding", "dispatchId", "commandS
 _CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")  # a refusal or error code: content-free, never echoed text
 _DLC_RE = re.compile(r"^dlc_[A-Za-z0-9_-]{32,}$")
 _AGX_RE = re.compile(r"^agx_[A-Za-z0-9_-]{32,}$")
-_REVISION_RE = re.compile(r"^[1-9][0-9]{0,18}$")
+_JOURNAL_RE = re.compile(r"^[\x20-\x7e]{1,128}$")  # printable ASCII, no control characters
 
 # Only what this plugin implements; the proof is separate from open-pool consent, which the plugin never
 # claims or sets.
@@ -41,9 +48,10 @@ IMPLEMENTED_CAPABILITIES = (
     "same_session_continuation",
     "durable_inspect_recovery",
     "cancel_report_fencing",
+    "cloud_start_headers_v1",
 )
-_CHALLENGE_KEYS = frozenset({"protocolVersion", "executorId", "executorConnectionRevision", "nonce",
-                             "requiredCapabilities"})
+_CAPABILITY_KEYS = frozenset({"protocolVersion", "executorId", "executorConnectionRevision", "nonce",
+                              "requiredCapabilities"})
 
 
 class Refused(Exception):
@@ -167,16 +175,17 @@ def parse_start_response(body: object) -> tuple[str, object] | None:
     return "permit", permit
 
 
-def parse_bootstrap_response(body: object) -> str | None:
-    """The ``dlc_`` of bootstrap-response.json (exactly ``credential`` and an offset ``expiresAt``), else None."""
+def parse_bootstrap_response(body: object) -> tuple[str, datetime] | None:
+    """``(dlc_, expiresAt)`` of bootstrap-response.json (exactly ``credential`` and an offset ``expiresAt``),
+    else None."""
     if not isinstance(body, dict) or set(body) != {"credential", "expiresAt"}:
         return None
     try:
-        parse_start_by(body["expiresAt"])
+        expires_at = parse_start_by(body["expiresAt"])
     except Refused:
         return None
     credential = body["credential"]
-    return credential if isinstance(credential, str) and _DLC_RE.match(credential) else None
+    return (credential, expires_at) if isinstance(credential, str) and _DLC_RE.match(credential) else None
 
 
 def parse_report_response(body: object) -> tuple[bool, bool] | None:
@@ -188,33 +197,39 @@ def parse_report_response(body: object) -> tuple[bool, bool] | None:
     return body["recorded"], body["currentOccupant"]
 
 
-def parse_capability_verdict(body: object) -> dict | None:
-    """capability-response.json or capability-refusal-response.json, else None."""
-    if not isinstance(body, dict):
-        return None
-    if body.get("eligibility") == "pool_capable" and set(body) == {"eligibility", "capabilityRevision",
-                                                                   "executorConnectionRevision"}:
-        revisions = (body["capabilityRevision"], body["executorConnectionRevision"])
-        return body if all(isinstance(r, str) and _REVISION_RE.match(r) for r in revisions) else None
-    if body.get("eligibility") == "own_agent_only" and set(body) == {"eligibility", "reason"} and body["reason"] in (
-            "proof_invalid", "challenge_mismatch", "missing_capability"):
-        return body
-    return None
+def start_journal_id(assignment_id: str) -> str:
+    """The server's defined locator for an assignment: ``agj_`` + the assignment id without hyphens."""
+    return "agj_" + assignment_id.replace("-", "")
 
 
-def answer_capability_challenge(challenge: object, *, executor_id: str, connection_revision: str,
-                                runtime_version: str) -> dict | None:
-    """capability-proof.json for a strict capability-challenge.json addressed to this executor, else None.
-    The proof lists only what this plugin implements and claims no open-pool consent."""
-    if not isinstance(challenge, dict) or set(challenge) != _CHALLENGE_KEYS:
-        return None
-    nonce, required = challenge["nonce"], challenge["requiredCapabilities"]
-    if (challenge["protocolVersion"] != PROTOCOL_VERSION or type(challenge["protocolVersion"]) is not int
-            or challenge["executorId"] != executor_id or challenge["executorConnectionRevision"] != connection_revision
+def pool_grant(values: Callable[[str], list[str] | None]) -> tuple[str, str]:
+    """``(agx_, startJournalId)`` from the start headers; ``values(name)`` returns every value of one
+    case-insensitive header (``http.client.HTTPMessage.get_all``). Exactly one non-empty, well-formed value
+    each, or ``Refused("invalid_pool_headers")``."""
+    def one(name: str, pattern: re.Pattern) -> str:
+        found = values(name) or []
+        if len(found) != 1 or not pattern.match(found[0]):
+            raise Refused("invalid_pool_headers")
+        return found[0]
+
+    if one(PROTOCOL_HEADER, re.compile(r"^1$")) != str(PROTOCOL_VERSION):
+        raise Refused("invalid_pool_headers")
+    return one(CREDENTIAL_HEADER, _AGX_RE), one(JOURNAL_HEADER, _JOURNAL_RE)
+
+
+def capability_answer(params: object, *, executor_id: str, connection_revision: str, runtime_version: str) -> dict:
+    """cloud-capability-result.json ``result`` for a strict cloud-capability-request.json ``params``
+    addressed to this executor, else ``Refused("capability_mismatch")``. The answer lists only what this
+    plugin implements and claims no open-pool consent."""
+    if not isinstance(params, dict) or set(params) != _CAPABILITY_KEYS:
+        raise Refused("capability_mismatch")
+    nonce, required = params["nonce"], params["requiredCapabilities"]
+    if (type(params["protocolVersion"]) is not int or params["protocolVersion"] != PROTOCOL_VERSION
+            or params["executorId"] != executor_id or params["executorConnectionRevision"] != connection_revision
             or not isinstance(nonce, str) or not 32 <= len(nonce) <= 128
             or not isinstance(required, list) or not required
             or not all(isinstance(c, str) and c in IMPLEMENTED_CAPABILITIES for c in required)):
-        return None
+        raise Refused("capability_mismatch")
     return {"protocolVersion": PROTOCOL_VERSION, "executorId": executor_id,
             "executorConnectionRevision": connection_revision, "nonce": nonce,
             "capabilities": list(IMPLEMENTED_CAPABILITIES), "runtimeVersion": runtime_version}

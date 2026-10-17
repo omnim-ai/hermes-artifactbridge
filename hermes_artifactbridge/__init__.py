@@ -16,7 +16,7 @@ from . import pool_adapter
 from .endpoint import is_trusted_url
 from .pool_core import CREDENTIALS, POOL_PLATFORM, PoolControl, PoolCore
 from .pool_journal import Journal
-from .pool_protocol import answer_capability_challenge, is_bigint_string, is_uuid
+from .pool_protocol import is_bigint_string, is_uuid
 from .schemas import POOL_TOOL_SCHEMAS, POOL_TOOLSET, TOOL_SCHEMAS, TOOLSET
 from .tools import PooledTools, ScopedTools
 
@@ -24,11 +24,10 @@ logger = logging.getLogger(__name__)
 
 VERSION = "0.2.0.dev0"
 POOL_ENABLED_ENV = "ARTIFACTBRIDGE_POOL_ENABLED"
-POOL_CREDENTIAL_ENV = "ARTIFACTBRIDGE_POOL_EXECUTOR_CREDENTIAL"
 POOL_EXECUTOR_ID_ENV = "ARTIFACTBRIDGE_POOL_EXECUTOR_ID"
 POOL_REVISION_ENV = "ARTIFACTBRIDGE_POOL_CONNECTION_REVISION"
 POOL_PORT_ENV = "ARTIFACTBRIDGE_POOL_PORT"
-POOL_REQUIRED_ENV = (POOL_ENABLED_ENV, POOL_CREDENTIAL_ENV, POOL_EXECUTOR_ID_ENV, POOL_REVISION_ENV)
+POOL_REQUIRED_ENV = (POOL_ENABLED_ENV, POOL_EXECUTOR_ID_ENV, POOL_REVISION_ENV)
 SERVICE_CREDENTIAL_ENV = "ARTIFACTBRIDGE_SERVICE_CREDENTIAL"
 TOOLS_URL_ENV = "ARTIFACTBRIDGE_TOOLS_URL"
 DEFAULT_TOOLS_URL = "https://app.artifactbridge.com/mcp/agent-gateway"
@@ -89,18 +88,12 @@ def _pool_setting(name: str) -> str:
 
 
 def _pool_configured() -> bool:
-    """Pooled execution is opt-in and off by default: its server routes are not deployed yet (README GAP-A/B)."""
-    return (_pool_setting(POOL_ENABLED_ENV) == "1" and _pool_setting(POOL_CREDENTIAL_ENV).startswith("agx_")
+    """Pooled execution is opt-in and off by default: its server routes are not merged or deployed yet (README).
+    The listener also needs the stock remote bearer (``A2A_BEARER_TOKEN`` / ``A2A_PEER_TOKENS``); it refuses to
+    serve without one. Each assignment's ``agx_`` arrives with its own requests: there is no executor-wide one."""
+    return (_pool_setting(POOL_ENABLED_ENV) == "1"
             and is_uuid(_pool_setting(POOL_EXECUTOR_ID_ENV)) and is_bigint_string(_pool_setting(POOL_REVISION_ENV))
             and is_trusted_url(_tools_url()))
-
-
-def capability_proof(challenge: object) -> dict | None:
-    """capability-proof.json for a challenge to the configured executor; None unless pooled mode is configured."""
-    if not _pool_configured():
-        return None
-    return answer_capability_challenge(challenge, executor_id=_pool_setting(POOL_EXECUTOR_ID_ENV),
-                                       connection_revision=_pool_setting(POOL_REVISION_ENV), runtime_version=VERSION)
 
 
 def _journal_path() -> Path:
@@ -119,7 +112,7 @@ def _pool_port(config) -> int:
 def _pool_adapter_factory(config):
     """Runs inside the serving profile's scope: settings and the journal come from that profile."""
     core = PoolCore(journal=Journal(_journal_path()),
-                    control=PoolControl(tools_url=_tools_url(), credential=_pool_setting(POOL_CREDENTIAL_ENV)),
+                    control=PoolControl(tools_url=_tools_url()),
                     executor_id=_pool_setting(POOL_EXECUTOR_ID_ENV), connection_revision=_pool_setting(POOL_REVISION_ENV))
     return pool_adapter.build_adapter_class()(config, core=core, port=_pool_port(config))
 

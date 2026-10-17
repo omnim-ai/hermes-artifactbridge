@@ -1,10 +1,12 @@
 """Durable pooled-dispatch journal: one stdlib sqlite3 file (WAL) under the active Hermes home.
 
 One row per dispatch identity (assignmentId, dispatchId) holding the full envelope as first received,
-the locally generated stable startJournalId, the state, the report sequence, and the A2A task/context
-ids. States: journaled -> start_requested -> permitted -> spawned -> finished | refused | uncertain.
-No secrets: the agx_ control credential and the dlc_ task credential never reach this file. Rows are
-never deleted (a refused or withdrawn row keeps its context known).
+the server's startJournalId (from the start headers), the SHA-256 fingerprint of the assignment's agx_
+grant, the state, the report sequence, and the A2A task/context ids. States: journaled -> start_requested
+-> permitted -> spawned (spawn intent; the A2A task is Submitted) -> running (Hermes admitted the turn;
+Working) -> finished | refused | uncertain. No secrets: the agx_ control credential and the dlc_ task
+credential never reach this file. Rows are never deleted (a refused or withdrawn row keeps its context
+known).
 
 Reports are durable: ``pending_reports`` holds the row's unacknowledged, content-free report bodies in
 sequence order, appended in the same transaction that allocates the sequence and makes the lifecycle
@@ -43,14 +45,18 @@ CREATE TABLE IF NOT EXISTS dispatches (
     updated_at REAL NOT NULL,
     pending_reports TEXT,
     report_refusal TEXT,
+    grant_fingerprint TEXT,
+    hermes_session_key TEXT,
+    hermes_session_id TEXT,
     PRIMARY KEY (assignment_id, dispatch_id)
 );
 CREATE INDEX IF NOT EXISTS dispatches_dispatch ON dispatches (dispatch_id);
 CREATE INDEX IF NOT EXISTS dispatches_delegation ON dispatches (delegation_id);
 CREATE INDEX IF NOT EXISTS dispatches_context ON dispatches (context_id);
+CREATE INDEX IF NOT EXISTS dispatches_journal ON dispatches (start_journal_id);
 """
 # Columns added after 0.2.0.dev0's first schema; an existing journal gains them on open.
-_ADDED_COLUMNS = ("pending_reports", "report_refusal")
+_ADDED_COLUMNS = ("pending_reports", "report_refusal", "grant_fingerprint", "hermes_session_key", "hermes_session_id")
 
 
 def _row(raw: sqlite3.Row | None) -> dict | None:
@@ -72,16 +78,20 @@ class Tx:
                                        key).fetchone())
 
     def where(self, column: str, value: str) -> list[dict]:
-        assert column in ("dispatch_id", "delegation_id", "context_id", "state")
+        assert column in ("dispatch_id", "delegation_id", "context_id", "state", "start_journal_id")
         return [_row(r) for r in self._conn.execute(f"SELECT * FROM dispatches WHERE {column} = ?", (value,))]
 
-    def insert(self, envelope: dict, start_journal_id: str, context_id: str) -> dict:
+    def insert(self, envelope: dict, start_journal_id: str, context_id: str, grant_fingerprint: str,
+               task_id: str) -> dict:
+        """``task_id`` is the dispatch's one A2A task id, fixed before the first answer so every retry,
+        refusal or lost control response answers the same task."""
         binding = envelope["binding"]
         self._conn.execute(
             "INSERT INTO dispatches (assignment_id, dispatch_id, delegation_id, envelope, start_journal_id, state,"
-            " context_id, updated_at) VALUES (?, ?, ?, ?, ?, 'journaled', ?, ?)",
+            " context_id, task_id, updated_at, grant_fingerprint) VALUES (?, ?, ?, ?, ?, 'journaled', ?, ?, ?, ?)",
             (binding["assignmentId"], envelope["dispatchId"], binding["delegationId"],
-             json.dumps(envelope, sort_keys=True, separators=(",", ":")), start_journal_id, context_id, time.time()))
+             json.dumps(envelope, sort_keys=True, separators=(",", ":")), start_journal_id, context_id, task_id,
+             time.time(), grant_fingerprint))
         return self.get((binding["assignmentId"], envelope["dispatchId"]))
 
     def update(self, key: tuple[str, str], *, from_states: tuple[str, ...], **fields: object) -> bool:
@@ -103,16 +113,19 @@ class Tx:
 
     def with_pending_reports(self) -> list[dict]:
         return [_row(r) for r in self._conn.execute(
-            "SELECT * FROM dispatches WHERE pending_reports IS NOT NULL ORDER BY updated_at")]
+            "SELECT * FROM dispatches WHERE pending_reports IS NOT NULL AND report_refusal IS NULL"
+            " ORDER BY updated_at")]
 
     def ack_report(self, key: tuple[str, str], sequence: int, refusal: str | None = None) -> None:
-        """Drop the acknowledged (or permanently refused) report ``sequence``; record a refusal apart."""
-        row = self.get(key)
-        bodies = json.loads(row["pending_reports"] or "[]")
-        self._set_pending(key, [b for b in bodies if b["reportSequence"] != sequence])
+        """Drop the acknowledged report ``sequence``. A permanent refusal is no acknowledgment: the report
+        stays pending and the row is blocked by ``report_refusal`` (no retry, no later sequence)."""
         if refusal:
             self._conn.execute("UPDATE dispatches SET report_refusal = ? WHERE assignment_id = ? AND dispatch_id = ?",
                                (refusal, *key))
+            return
+        row = self.get(key)
+        bodies = json.loads(row["pending_reports"] or "[]")
+        self._set_pending(key, [b for b in bodies if b["reportSequence"] != sequence])
 
     def _set_pending(self, key: tuple[str, str], bodies: list[dict]) -> None:
         self._conn.execute("UPDATE dispatches SET pending_reports = ? WHERE assignment_id = ? AND dispatch_id = ?",

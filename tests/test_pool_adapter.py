@@ -1,17 +1,21 @@
-"""The ``artifactbridge-pool`` adapter against the real Hermes stock A2A adapter (skipped without Hermes):
-the intercept runs before any MessageEvent, a permitted dispatch runs exactly once on its own
-(platform, contextId, task id) binding, cancel acknowledges, a late reply never answers a newer task."""
+"""The ``artifactbridge-pool`` listener over real HTTP against the real Hermes stock A2A adapter and the real
+Hermes message pipeline (skipped without Hermes). Requests are the generated cloud-contract-r2 fixtures
+(tests/fixtures/cloud_r2), sent to the listener's real ``connect()`` socket with the server's headers; only
+the model (``_message_handler``) and the server's control routes (FakeControl) are stand-ins."""
 import asyncio
+import copy
+import http.client
 import json
 import threading
-import time
+import urllib.parse
 
 import pytest
 
 pytest.importorskip("plugins.platforms.a2a.adapter", exc_type=ImportError)
 
-from gateway.config import PlatformConfig  # noqa: E402
+from gateway.config import GatewayConfig, PlatformConfig  # noqa: E402
 from gateway.platform_registry import PlatformEntry, platform_registry  # noqa: E402
+from gateway.session import SessionStore  # noqa: E402
 from plugins.platforms.a2a import _PLATFORM_HINT, protocol  # noqa: E402
 
 import hermes_artifactbridge as plugin_module  # noqa: E402
@@ -21,17 +25,26 @@ from hermes_artifactbridge.pool_journal import Journal  # noqa: E402
 from hermes_artifactbridge.pool_protocol import report_body  # noqa: E402
 from tests import fake_ab, fake_pool  # noqa: E402
 from tests.conftest import FakeCtx  # noqa: E402
-from tests.fake_pool import EXECUTOR_CREDENTIAL, EXECUTOR_ID, REVISION, Clock, FakeControl, envelope, fixture  # noqa: E402
+from tests.fake_pool import EXECUTOR_ID, REVISION, Clock, FakeControl, envelope, fixture, grant_for  # noqa: E402
 
-POOL_ENV = {"ARTIFACTBRIDGE_POOL_ENABLED": "1", "ARTIFACTBRIDGE_POOL_EXECUTOR_CREDENTIAL": EXECUTOR_CREDENTIAL,
-            "ARTIFACTBRIDGE_POOL_EXECUTOR_ID": EXECUTOR_ID, "ARTIFACTBRIDGE_POOL_CONNECTION_REVISION": REVISION}
-CTX = "ctx-original"
+POOL_ENV = {"ARTIFACTBRIDGE_POOL_ENABLED": "1", "ARTIFACTBRIDGE_POOL_EXECUTOR_ID": EXECUTOR_ID,
+            "ARTIFACTBRIDGE_POOL_CONNECTION_REVISION": REVISION}
+SEND = fixture("cloud-send-request.json")
+BEARER = SEND["headers"]["authorization"].removeprefix("Bearer ")
+CONTEXT = SEND["body"]["params"]["message"]["contextId"]
+AGX, JOURNAL = SEND["headers"]["x-ab-control-credential"], SEND["headers"]["x-ab-start-journal-id"]
+SECRETS = (b"agx_", b"dlc_", BEARER.encode())
+TURN_BOUND = 30.0  # generous: the private loop thread can be starved on a loaded host
 
 
 @pytest.fixture
 def pool_env(monkeypatch, tmp_path):
+    for name in ("A2A_PEER_TOKENS", "A2A_TRUSTED_PEERS", "A2A_ALLOW_ALL_USERS", "A2A_HOST", "A2A_PORT",
+                 "A2A_PUBLIC_URL"):
+        monkeypatch.delenv(name, raising=False)
     for name, value in POOL_ENV.items():
         monkeypatch.setenv(name, value)
+    monkeypatch.setenv("A2A_BEARER_TOKEN", BEARER)
     monkeypatch.setenv("ARTIFACTBRIDGE_SERVICE_CREDENTIAL", fake_ab.SERVICE_CREDENTIAL)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
 
@@ -61,57 +74,164 @@ def server():
     return FakeControl(clock=Clock())
 
 
-@pytest.fixture
-def credentials():
-    return CredentialBindings()
+class Model:
+    """The stand-in model behind Hermes' real message pipeline. ``behavior`` maps the A2A task id's turn
+    number (0, 1, ...) to ``"block"`` (wait until released or canceled), ``"stubborn"`` (ignore a cancel
+    until released) or a reply text (default "done")."""
+
+    def __init__(self, credentials, sessions):
+        self.credentials, self.sessions = credentials, sessions
+        self.turns, self.seen_credentials, self.behavior, self.session_ids = [], [], {}, []
+        self.started = [threading.Event() for _ in range(4)]
+        self.release = threading.Event()
+
+    async def __call__(self, event):
+        n = len(self.turns)
+        self.turns.append(event)
+        self.seen_credentials.append(self.credentials.lookup(event.source.platform.value, event.source.chat_id,
+                                                             event.source.message_id))
+        # The gateway runner opens (or resumes) the turn's Hermes session before the agent runs.
+        self.session_ids.append((await asyncio.to_thread(self.sessions.get_or_create_session, event.source)).session_id)
+        self.started[n].set()
+        behavior = self.behavior.get(n, "done")
+        if behavior == "block":
+            await asyncio.to_thread(self.release.wait, TURN_BOUND)
+            return "done"
+        if behavior == "stubborn":
+            while not self.release.is_set():
+                try:
+                    await asyncio.to_thread(self.release.wait, TURN_BOUND)
+                except asyncio.CancelledError:
+                    continue
+            return "done after all"
+        return behavior
+
+
+class Listener:
+    """One listener process: its own journal connection, core, adapter, loop thread and socket."""
+
+    def __init__(self, journal_path, server, *, connect=True):
+        self.credentials = CredentialBindings(now=server.clock)
+        self.core = PoolCore(journal=Journal(journal_path),
+                             control=PoolControl(tools_url=fake_pool.TOOLS_URL, http_factory=server.factory),
+                             executor_id=EXECUTOR_ID, connection_revision=REVISION, credentials=self.credentials,
+                             now=server.clock)
+        self.adapter = pool_adapter.build_adapter_class()(PlatformConfig(enabled=True, extra={}), core=self.core,
+                                                          port=0)
+        self.sessions = SessionStore(journal_path.parent / "sessions", GatewayConfig())  # Hermes' real store
+        self.adapter.set_session_store(self.sessions)
+        self.model = Model(self.credentials, self.sessions)
+        self.adapter.set_message_handler(self.model)
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+        self.thread.start()
+        self.connected = self.run(self.adapter.connect()) if connect else None
+
+    def run(self, coroutine, timeout=TURN_BOUND):
+        return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result(timeout)
+
+    @property
+    def url(self) -> str:  # the a2aUrl the server would register: the card's pinned interface URL
+        return f"http://127.0.0.1:{self.adapter._httpd.server_address[1]}/"
+
+    def request(self, method: str, url: str, headers: dict, body) -> tuple[int, dict]:
+        target = urllib.parse.urlsplit(url)
+        conn = http.client.HTTPConnection("127.0.0.1", self.adapter._httpd.server_address[1], timeout=TURN_BOUND)
+        try:
+            payload = None if body is None else json.dumps(body).encode()
+            conn.putrequest(method, target.path or "/", skip_accept_encoding=True)
+            for name, value in headers:
+                conn.putheader(name, value)
+            if payload is not None:
+                conn.putheader("content-length", str(len(payload)))
+            conn.endheaders(payload)
+            response = conn.getresponse()
+            return response.status, json.loads(response.read() or b"null")
+        finally:
+            conn.close()
+
+    def call(self, name: str, *, body=None, headers=None, drop=(), extra=()) -> tuple[int, dict]:
+        """The fixture request ``name`` on this listener: its headers (minus ``drop``, plus ``extra``), its
+        body or ``body``; the card's URL resolves from the registered a2aUrl as the server resolves it."""
+        request = fixture(name)
+        pairs = [(k, v) for k, v in (headers if headers is not None else request["headers"]).items() if k not in drop]
+        url = (urllib.parse.urljoin(self.url, ".well-known/agent-card.json") if request["method"] == "GET"
+               else self.url)
+        return self.request(request["method"], url, [*pairs, *extra], request["body"] if body is None else body)
+
+    def crash(self):
+        """The process dies: the socket closes and the loop stops; no shutdown code runs, so the in-flight
+        turn records nothing."""
+        httpd, self.adapter._httpd = self.adapter._httpd, None
+        httpd.shutdown()
+        httpd.server_close()
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(5)
+
+    def stop(self):
+        if self.adapter._httpd is not None:
+            self.run(self.adapter.disconnect())
+        self.model.release.set()
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(5)
 
 
 @pytest.fixture
-def adapter(registered, server, credentials, tmp_path):
-    core = PoolCore(journal=Journal(tmp_path / "journal.sqlite3"),
-                    control=PoolControl(tools_url=fake_pool.TOOLS_URL, credential=EXECUTOR_CREDENTIAL,
-                                        http_factory=server.factory),
-                    executor_id=EXECUTOR_ID, connection_revision=REVISION, credentials=credentials, now=server.clock)
-    adapter = pool_adapter.build_adapter_class()(PlatformConfig(enabled=True, extra={}), core=core, port=0)
-    adapter.turns = []          # every MessageEvent that would have reached the model
-    adapter.replies = {}        # task id -> reply the fake model sends (None = never reply)
-    adapter.seen_credentials = []
-
-    async def fake_handle_message(event):
-        adapter.turns.append(event)
-        adapter.seen_credentials.append(credentials.lookup(event.source.platform.value, event.source.chat_id,
-                                                           event.source.message_id))
-        reply = adapter.replies.get(event.message_id, "done")
-        if reply is not None:
-            await adapter.send(event.source.chat_id, reply, reply_to=event.message_id, metadata={"notify": True})
-
-    adapter.handle_message = fake_handle_message
-    adapter._message_handler = object()
-    loop = asyncio.new_event_loop()
-    thread = threading.Thread(target=loop.run_forever, daemon=True)
-    thread.start()
-    adapter._loop = loop
-    yield adapter
-    loop.call_soon_threadsafe(loop.stop)
-    thread.join(5)
+def journal_path(tmp_path):
+    return tmp_path / "journal.sqlite3"
 
 
-def send(adapter, metadata, context_id="", text="Please do the task."):
-    message = protocol.text_message(protocol.ROLE_USER, text, context_id=context_id)
-    params = {"message": message} if metadata is None else {"message": message, "metadata": metadata}
-    return adapter._rpc_message_send("1", params, "peer-1")["result"]
+@pytest.fixture
+def listeners(registered, server, journal_path):
+    started = []
+
+    def start(**kwargs):
+        started.append(Listener(journal_path, server, **kwargs))
+        return started[-1]
+
+    yield start
+    for listener in reversed(started):
+        listener.stop()
 
 
-def state(task):
-    return task["status"]["state"]
+@pytest.fixture
+def listener(listeners):
+    return listeners()
 
 
-def wait_until(predicate, timeout=5.0):
-    deadline = time.time() + timeout
-    while not predicate():
-        assert time.time() < deadline
-        time.sleep(0.01)
+def with_id(name: str, task_id: str) -> dict:
+    """A Get/Cancel fixture body for the remote task id the server recorded from the Send answer."""
+    body = copy.deepcopy(fixture(name)["body"])
+    body["params"]["id"] = task_id
+    return body
 
+
+def journaled(journal_path, journal=JOURNAL) -> list[dict]:
+    with Journal(journal_path).tx() as tx:
+        return tx.where("start_journal_id", journal)
+
+
+def no_tasks(listener) -> bool:
+    return listener.adapter.tasks.list()[0] == []
+
+
+def task_of(answer: dict) -> dict:
+    return answer["result"]["task"] if "task" in answer["result"] else answer["result"]
+
+
+def wait_for(event: threading.Event):
+    assert event.wait(TURN_BOUND), "the turn never reached the model"
+
+
+def settle(listener, task_id: str):
+    """Until this task's finalizer recorded its outcome."""
+    finalizer = listener.adapter._finalizers.get(task_id)
+    if finalizer is not None:
+        finalizer.join(TURN_BOUND)
+        assert not finalizer.is_alive()
+
+
+# ---- shape and registration ----
 
 def test_this_hermes_is_the_tested_shape_and_an_untested_version_is_refused(monkeypatch):
     assert pool_adapter.hermes_shape_supported() is True
@@ -136,117 +256,349 @@ def test_factory_builds_on_the_pooled_platform_and_port_with_a_journal_under_her
     assert plugin_module._pool_adapter_factory(PlatformConfig(enabled=True, extra={"port": 9912})).port == 9912
 
 
-@pytest.mark.parametrize("metadata", [
-    None, {}, {"artifactbridge.assignment": "x"},
-    fake_pool.metadata({**envelope(), "protocolVersion": 2}),
-    fake_pool.metadata(envelope(binding={"executorId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000099"})),
-], ids=["absent", "empty", "malformed", "unknown-version", "other-executor"])
-def test_every_request_is_intercepted_before_any_model_invocation(adapter, server, metadata):
-    task = send(adapter, metadata)
-    assert state(task) == protocol.STATE_REJECTED and "refused" in json.dumps(task)
-    assert adapter.turns == [] and adapter._pending == {} and server.requests == []
-    assert adapter.tasks.get(task["id"])["state"] == protocol.STATE_REJECTED
+# ---- bearer, card, capability, method set ----
+
+def test_without_a_remote_bearer_the_listener_never_binds(listeners, monkeypatch):
+    monkeypatch.delenv("A2A_BEARER_TOKEN")
+    listener = listeners(connect=False)
+    assert listener.run(listener.adapter.connect()) is False
+    assert listener.adapter._httpd is None and listener.adapter.fatal_error_code == "bearer_required"
 
 
-def test_a_cloud_assignment_the_server_did_not_start_never_reaches_the_model(adapter, server, credentials):
-    server.cloud = True  # the server lifecycle owns cloud start; an unknown journal gets start_not_authorized
-    task = send(adapter, server.issue(envelope()), CTX)
-    assert state(task) == protocol.STATE_REJECTED and "start_not_authorized" in json.dumps(task)
-    assert adapter.turns == [] and adapter._pending == {} and credentials._bound == {}
-    assert len(server.starts) == 1 and server.bootstraps == [] and server.reports == []
+@pytest.mark.parametrize("name", ["cloud-card-request.json", "cloud-capability-request.json",
+                                  "cloud-send-request.json", "cloud-get-task-request.json",
+                                  "cloud-list-tasks-request.json", "cloud-cancel-request.json"])
+@pytest.mark.parametrize("authorization", [None, "Bearer " + "W" * 43], ids=["absent", "wrong"])
+def test_the_card_and_every_method_require_the_remote_bearer(listener, server, journal_path, name, authorization):
+    server.issue(envelope())
+    extra = [("authorization", authorization)] if authorization else []
+    status, answer = listener.call(name, drop=("authorization",), extra=extra)
+    assert (status, answer["error"]["code"]) == (401, protocol.ERR_UNAUTHORIZED)
+    assert listener.model.turns == [] and server.requests == [] and no_tasks(listener) and journaled(journal_path) == []
 
 
-def test_a_permitted_dispatch_runs_once_with_its_own_binding_and_reports_completion(adapter, server, credentials):
-    metadata = server.issue(envelope())
-    task = send(adapter, metadata, CTX)
-    assert (state(task), task["contextId"]) == (protocol.STATE_COMPLETED, CTX)
-    event = adapter.turns[0]
-    assert (event.source.platform.value, event.source.chat_id, event.source.message_id) == (POOL_PLATFORM, CTX, task["id"])
-    assert event.text != "Please do the task." and "Please do the task." in event.text  # stock inbound framing
-    assert adapter.seen_credentials[0] in server.issued
-    assert credentials.lookup(POOL_PLATFORM, CTX, task["id"]) is None
-    assert [r["kind"] for r in server.reports] == ["running", "stopped"] and server.reports[-1]["outcome"] == "completed"
-
-    again = send(adapter, metadata, CTX)  # duplicate delivery: the recorded result, no second turn
-    assert (state(again), protocol.extract_text(again["artifacts"][0])) == (protocol.STATE_COMPLETED, "done")
-    assert len(adapter.turns) == 1 and len(server.starts) == 1
+def test_the_card_pins_the_registered_listener_url_on_the_jsonrpc_binding(listener):
+    status, card = listener.call("cloud-card-request.json")
+    assert status == 200
+    assert [(i["url"], i["protocolBinding"]) for i in card["supportedInterfaces"]] == [(listener.url, "JSONRPC")]
 
 
-def test_an_input_required_reply_reports_input_wait(adapter, server):
-    metadata = server.issue(envelope())
-    original = adapter.handle_message
-
-    async def asks(event):
-        adapter.replies[event.message_id] = "[INPUT_REQUIRED] Which document?"
-        await original(event)
-
-    adapter.handle_message = asks
-    task = send(adapter, metadata, CTX)
-    assert state(task) == protocol.STATE_INPUT_REQUIRED
-    assert server.reports[-1]["outcome"] == "input_wait"
+def test_the_capability_request_is_answered_from_this_executors_configuration(listener, server):
+    status, answer = listener.call("cloud-capability-request.json")
+    expected = fixture("cloud-capability-result.json")
+    assert status == 200 and answer["id"] == expected["id"]
+    assert answer["result"] == {**expected["result"], "runtimeVersion": plugin_module.VERSION}
+    assert server.requests == [] and listener.model.turns == []
 
 
-def test_concurrent_duplicate_deliveries_run_one_turn(adapter, server):
-    metadata = server.issue(envelope())
-    original = adapter.handle_message
+@pytest.mark.parametrize("change", [{"executorConnectionRevision": "2"}, {"protocolVersion": 2},
+                                    {"requiredCapabilities": ["open_pool_consent", "pool_lease_v1"]}],
+                         ids=["other-revision", "other-protocol", "missing-capability"])
+def test_a_capability_request_this_executor_cannot_satisfy_gets_an_error_not_a_result(listener, change):
+    body = copy.deepcopy(fixture("cloud-capability-request.json")["body"])
+    body["params"].update(change)
+    status, answer = listener.call("cloud-capability-request.json", body=body)
+    assert status == 200 and "result" not in answer and answer["error"]["code"] == protocol.ERR_INVALID_PARAMS
 
-    async def slow(event):
-        await asyncio.sleep(0.2)
-        await original(event)
 
-    adapter.handle_message = slow
-    results = []
-    threads = [threading.Thread(target=lambda: results.append(send(adapter, metadata, CTX))) for _ in range(4)]
+@pytest.mark.parametrize("method", ["SendStreamingMessage", "message/send", "tasks/cancel", "SubscribeToTask",
+                                    "CreateTaskPushNotificationConfig", "artifactbridge/pool/unknown"])
+def test_every_other_method_is_method_not_found_and_never_reaches_the_stock_handlers(listener, server, method):
+    body = {**SEND["body"], "method": method, "id": fixture("cloud-capability-error-method-not-found.json")["id"]}
+    status, answer = listener.call("cloud-send-request.json", body=body)
+    assert (status, answer) == (200, fixture("cloud-capability-error-method-not-found.json"))
+    assert listener.model.turns == [] and server.requests == []
+
+
+# ---- start headers ----
+
+@pytest.mark.parametrize("drop, extra", [
+    (("x-ab-control-credential",), ()),
+    (("x-ab-start-journal-id",), ()),
+    (("x-ab-pool-protocol-version",), ()),
+    ((), (("x-ab-control-credential", AGX),)),
+    ((), (("X-AB-Start-Journal-Id", JOURNAL),)),
+    (("x-ab-control-credential",), (("x-ab-control-credential", ""),)),
+    (("x-ab-control-credential",), (("x-ab-control-credential", "dlc_" + "A" * 43),)),
+    (("x-ab-start-journal-id",), (("x-ab-start-journal-id", "agj_" + "0" * 129),)),
+    (("x-ab-pool-protocol-version",), (("x-ab-pool-protocol-version", "2"),)),
+], ids=["no-agx", "no-journal", "no-version", "duplicate-agx", "duplicate-journal", "empty-agx", "dlc-as-agx",
+        "long-journal", "other-version"])
+@pytest.mark.parametrize("name", ["cloud-send-request.json", "cloud-get-task-request.json",
+                                  "cloud-list-tasks-request.json", "cloud-cancel-request.json"])
+def test_missing_duplicate_or_malformed_start_headers_are_refused_before_any_task(listener, server, journal_path,
+                                                                                  name, drop, extra):
+    server.issue(envelope())
+    status, answer = listener.call(name, drop=drop, extra=extra)
+    assert status == 200 and answer["error"]["code"] == protocol.ERR_INVALID_PARAMS
+    assert "invalid_pool_headers" in answer["error"]["message"] and "result" not in answer
+    assert listener.model.turns == [] and server.requests == [] and no_tasks(listener) and journaled(journal_path) == []
+
+
+def test_a_grant_for_another_assignment_is_refused_without_a_row_or_a_start(listener, server, journal_path):
+    server.issue(envelope())
+    other = envelope(binding={"assignmentId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000042"})
+    agx, journal = grant_for(other)
+    headers = {**SEND["headers"], "x-ab-control-credential": agx, "x-ab-start-journal-id": journal}
+    status, answer = listener.call("cloud-send-request.json", headers=headers)
+    task = task_of(answer)
+    assert (status, task["status"]["state"]) == (200, protocol.STATE_REJECTED) and "journal_mismatch" in json.dumps(task)
+    assert listener.model.turns == [] and server.requests == []
+    assert journaled(journal_path) == [] and journaled(journal_path, journal) == []
+
+
+@pytest.mark.parametrize("change", [
+    {"artifactbridge.assignment": "x"}, {},
+    {"artifactbridge.assignment": {**envelope(), "protocolVersion": 2}},
+    {"artifactbridge.assignment": envelope(binding={"executorId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000099"})},
+    {"artifactbridge.assignment": envelope(binding={"executorConnectionRevision": "2"})},
+], ids=["malformed", "absent", "unknown-version", "other-executor", "other-revision"])
+def test_every_send_is_intercepted_before_any_model_invocation(listener, server, change):
+    body = copy.deepcopy(SEND["body"])
+    body["params"]["metadata"] = change
+    status, answer = listener.call("cloud-send-request.json", body=body)
+    task = task_of(answer)
+    assert (status, task["status"]["state"]) == (200, protocol.STATE_REJECTED) and "refused" in json.dumps(task)
+    assert listener.model.turns == [] and listener.adapter._pending == {} and server.requests == []
+
+
+# ---- Send ----
+
+def test_send_answers_working_with_the_assignment_and_never_waits_for_the_reply(listener, server):
+    listener.model.behavior[0] = "block"
+    server.issue(envelope())
+    status, answer = listener.call("cloud-send-request.json")
+    expected = fixture("cloud-send-response.json")
+    task = answer["result"]["task"]
+    assert status == 200 and answer["id"] == SEND["body"]["id"] and set(answer) == set(expected)
+    assert {k: v for k, v in task.items() if k not in ("id", "history")} == {
+        k: v for k, v in expected["result"]["task"].items() if k != "id"} | {"status": task["status"]}
+    assert task["status"]["state"] == expected["result"]["task"]["status"]["state"] == protocol.STATE_WORKING
+    assert task["metadata"] == expected["result"]["task"]["metadata"] and task["contextId"] == CONTEXT
+    event = listener.model.turns[0]
+    assert (event.source.platform.value, event.source.chat_id, event.source.message_id) == (POOL_PLATFORM, CONTEXT,
+                                                                                            task["id"])
+    assert listener.model.seen_credentials[0] in server.issued
+    assert server.starts == [fixture("cloud-start-replay-request.json")]
+    assert [r["kind"] for r in server.reports] == ["running"]
+
+    listener.model.release.set()
+    settle(listener, task["id"])
+    status, got = listener.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task["id"]))
+    assert got["result"]["status"]["state"] == protocol.STATE_COMPLETED and got["result"]["metadata"] == task["metadata"]
+    assert server.reports[-1] == {**fixture("report.json"), "reportSequence": 2}
+    assert listener.credentials.lookup(POOL_PLATFORM, CONTEXT, task["id"]) is None
+
+    status, again = listener.call("cloud-send-request.json")  # a lost ack: the same task, never a second turn
+    assert (task_of(again)["id"], task_of(again)["status"]["state"]) == (task["id"], protocol.STATE_COMPLETED)
+    assert len(listener.model.turns) == 1 and len(server.starts) == 1
+
+
+def test_a_send_hermes_has_not_admitted_yet_answers_submitted_never_working(listener, server, monkeypatch):
+    monkeypatch.setattr(pool_adapter, "_ADMISSION_WAIT", 0.2)
+    gate = threading.Event()
+    listener.loop.call_soon_threadsafe(gate.wait, TURN_BOUND)  # the gateway loop is busy: no turn can start
+    server.issue(envelope())
+    try:
+        _, sent = listener.call("cloud-send-request.json")
+    finally:
+        gate.set()
+    task = task_of(sent)
+    assert task["status"]["state"] == protocol.STATE_SUBMITTED and server.reports == []
+    wait_for(listener.model.started[0])
+    settle(listener, task["id"])
+    _, got = listener.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task["id"]))
+    assert got["result"]["status"]["state"] == protocol.STATE_COMPLETED
+    assert [r["kind"] for r in server.reports] == ["running", "stopped"]
+
+
+def test_concurrent_duplicate_sends_run_one_turn_and_answer_one_task(listener, server):
+    listener.model.behavior[0] = "block"
+    server.issue(envelope())
+    answers = []
+    threads = [threading.Thread(target=lambda: answers.append(listener.call("cloud-send-request.json")))
+               for _ in range(4)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join(10)
-    assert len(adapter.turns) == 1 and len(server.bootstraps) == 1
-    assert {state(r) for r in results} == {protocol.STATE_COMPLETED}
+        t.join(TURN_BOUND)
+    assert len(listener.model.turns) == 1 and len(server.bootstraps) == 1
+    assert len({task_of(a)["id"] for _, a in answers}) == 1 and len(answers) == 4
 
 
-def test_cancel_acknowledges_and_a_late_reply_never_answers_the_newer_task(adapter, server, credentials):
-    original = adapter.handle_message
-
-    async def never(event):
-        adapter.replies[event.message_id] = None
-        await original(event)
-
-    adapter.handle_message = never
-    first = []
-    runner = threading.Thread(target=lambda: first.append(send(adapter, server.issue(envelope()), CTX)))
-    runner.start()
-    wait_until(lambda: adapter.turns)
-    old_task = adapter.turns[0].message_id
-    canceled = adapter._rpc_tasks_cancel("2", {"id": old_task})["result"]
-    runner.join(5)
-    assert state(canceled) == state(first[0]) == protocol.STATE_CANCELED
-    assert server.reports[-1] == fixture("cancel-ack.json") and credentials.lookup(POOL_PLATFORM, CTX, old_task) is None
-
-    newer = envelope(binding={"assignmentId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000042", "executionGeneration": 2},
-                     dispatchId="dispatch-2")
-    second = []
-    runner = threading.Thread(target=lambda: second.append(send(adapter, server.issue(newer), CTX)))
-    runner.start()
-    wait_until(lambda: len(adapter.turns) == 2)
-    new_task = adapter.turns[1].message_id
-    reports = list(server.reports)
-    asyncio.run_coroutine_threadsafe(adapter.send(CTX, "late", reply_to=old_task, metadata={"notify": True}),
-                                     adapter._loop).result(5)
-    time.sleep(0.1)
-    assert second == [] and adapter.tasks.get(new_task)["state"] == protocol.STATE_WORKING
-    assert server.reports == reports and credentials.lookup(POOL_PLATFORM, CTX, new_task) is not None
-    asyncio.run_coroutine_threadsafe(adapter.send(CTX, "resumed", reply_to=new_task, metadata={"notify": True}),
-                                     adapter._loop).result(5)
-    runner.join(5)
-    assert state(second[0]) == protocol.STATE_COMPLETED
-    assert server.reports[-1] == report_body(newer["binding"], 2, "stopped", "completed")
+def test_no_secret_reaches_the_model_tasks_journal_logs_or_answers(listener, server, journal_path, tmp_path, caplog):
+    server.issue(envelope())
+    _, sent = listener.call("cloud-send-request.json")
+    task_id = task_of(sent)["id"]
+    settle(listener, task_id)
+    answers = [sent, listener.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task_id))[1],
+               listener.call("cloud-list-tasks-request.json")[1]]
+    blob = (json.dumps(answers) + listener.model.turns[0].text + repr(listener.adapter.tasks.list())
+            + caplog.text).encode()
+    blob += b"".join(p.read_bytes() for p in tmp_path.rglob("*") if p.is_file())  # journal, audit, history
+    assert [s for s in SECRETS if s in blob] == []
 
 
-def test_a_continuation_on_another_context_is_resume_unavailable(adapter, server):
-    send(adapter, server.issue(envelope()), CTX)
-    newer = envelope(binding={"assignmentId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000042", "executionGeneration": 2},
-                     dispatchId="dispatch-2")
-    task = send(adapter, server.issue(newer), "ctx-elsewhere")
-    assert state(task) == protocol.STATE_REJECTED and "resume_unavailable" in json.dumps(task)
-    assert len(adapter.turns) == 1
+# ---- continuation ----
+
+def test_the_continuation_resumes_the_original_context_with_a_new_task_after_input_required(listener, server):
+    listener.model.behavior[0] = "[INPUT_REQUIRED] Which tone?"
+    server.issue(envelope())
+    _, first = listener.call("cloud-send-request.json")
+    settle(listener, task_of(first)["id"])
+    assert server.reports[-1]["outcome"] == "input_wait"
+    continuation = fixture("cloud-continuation-request.json")
+    server.issue(fixture("cloud-continuation-envelope.json"))
+    listener.model.behavior[1] = "block"
+    status, answer = listener.call("cloud-continuation-request.json")
+    task, expected = answer["result"]["task"], fixture("cloud-continuation-response.json")["result"]["task"]
+    assert (task["contextId"], task["status"]["state"], task["metadata"]) == (
+        expected["contextId"], expected["status"]["state"], expected["metadata"])
+    assert task["id"] != task_of(first)["id"]
+    event = listener.model.turns[1]
+    assert (event.source.chat_id, event.source.message_id) == (continuation["body"]["params"]["message"]["contextId"],
+                                                               task["id"])
+    assert server.starts[-1] == fixture("cloud-continuation-start-request.json")
+    wait_for(listener.model.started[1])
+    assert listener.model.session_ids[1] == listener.model.session_ids[0]  # the same Hermes session, resumed
+
+
+def test_a_continuation_after_the_hermes_session_was_reset_is_resume_unavailable(listener, server, journal_path):
+    listener.model.behavior[0] = "[INPUT_REQUIRED] Which tone?"
+    server.issue(envelope())
+    _, first = listener.call("cloud-send-request.json")
+    settle(listener, task_of(first)["id"])
+    listener.sessions.reset_session(listener.adapter._event_session_key(listener.model.turns[0]))  # /new, rollover
+    server.issue(fixture("cloud-continuation-envelope.json"))
+    before = len(server.requests)
+    _, answer = listener.call("cloud-continuation-request.json")
+    task = task_of(answer)
+    assert task["status"]["state"] == protocol.STATE_REJECTED and "resume_unavailable" in json.dumps(task["status"])
+    assert len(listener.model.turns) == 1 and server.requests[before:] == []  # no start, no fresh-session turn
+    assert journaled(journal_path, fixture("cloud-continuation-request.json")["headers"]["x-ab-start-journal-id"]) == []
+
+
+# ---- identity of an unanswered start, ingress framing ----
+
+def test_a_send_whose_start_got_no_answer_keeps_one_task_id_across_retries(listener, server, journal_path):
+    server.faults[fake_pool.START_PATH] = ["down"]
+    server.issue(envelope())
+    _, lost = listener.call("cloud-send-request.json")
+    task = task_of(lost)
+    assert task["status"]["state"] == protocol.STATE_FAILED and listener.model.turns == []
+    assert task["metadata"] == fixture("cloud-send-response.json")["result"]["task"]["metadata"]
+    assert [(r["state"], r["task_id"]) for r in journaled(journal_path)] == [("start_requested", task["id"])]
+    _, retried = listener.call("cloud-send-request.json")  # the start now answers: the same task runs
+    assert task_of(retried)["id"] == task["id"]
+    wait_for(listener.model.started[0])
+    assert listener.model.turns[0].source.message_id == task["id"]
+
+
+@pytest.mark.parametrize("framing", ["negative-length", "signed-length", "duplicate-authorization"])
+def test_malformed_framing_is_refused_before_any_read_task_or_journal(listener, server, journal_path, framing):
+    server.issue(envelope())
+    port = listener.adapter._httpd.server_address[1]
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=TURN_BOUND)  # a hang here would be a negative read
+    try:
+        conn.putrequest("POST", "/", skip_accept_encoding=True)
+        for name, value in SEND["headers"].items():
+            conn.putheader(name, value)
+        payload = json.dumps(SEND["body"]).encode()
+        if framing == "duplicate-authorization":
+            conn.putheader("authorization", SEND["headers"]["authorization"])
+            conn.putheader("content-length", str(len(payload)))
+        else:
+            conn.putheader("content-length", "-1" if framing == "negative-length" else f"+{len(payload)}")
+        conn.endheaders(payload)
+        status = conn.getresponse().status
+    finally:
+        conn.close()
+    assert status == (401 if framing == "duplicate-authorization" else 400)
+    assert listener.model.turns == [] and server.requests == [] and no_tasks(listener) and journaled(journal_path) == []
+
+
+# ---- cancel ----
+
+def test_cancel_of_a_running_turn_is_canceled_only_after_the_runtime_stopped_it(listener, server):
+    listener.model.behavior[0] = "block"
+    server.issue(envelope())
+    _, sent = listener.call("cloud-send-request.json")
+    task_id = task_of(sent)["id"]
+    wait_for(listener.model.started[0])
+    status, answer = listener.call("cloud-cancel-request.json", body=with_id("cloud-cancel-request.json", task_id))
+    task = answer["result"]
+    assert (status, task["id"], task["status"]["state"]) == (200, task_id, protocol.STATE_CANCELED)
+    assert "artifactbridge.cancel" not in task["metadata"] and task["metadata"] == sent["result"]["task"]["metadata"]
+    assert server.reports[-1] == fixture("cancel-ack.json")
+    assert listener.credentials.lookup(POOL_PLATFORM, CONTEXT, task_id) is None
+    status, again = listener.call("cloud-cancel-request.json", body=with_id("cloud-cancel-request.json", task_id))
+    assert again["result"]["status"]["state"] == protocol.STATE_CANCELED and len(server.reports) == 2
+
+
+def test_cancel_the_runtime_did_not_confirm_stays_pending_and_the_real_outcome_is_recorded(listener, server,
+                                                                                           journal_path, monkeypatch):
+    monkeypatch.setattr(pool_adapter, "_CANCEL_CONFIRM_WAIT", 0.5)
+    listener.model.behavior[0] = "stubborn"  # the worker swallows the cancellation and keeps running
+    server.issue(envelope())
+    _, sent = listener.call("cloud-send-request.json")
+    task_id = task_of(sent)["id"]
+    wait_for(listener.model.started[0])
+    for _ in range(2):  # a repeated Cancel manufactures no stop either
+        _, answer = listener.call("cloud-cancel-request.json", body=with_id("cloud-cancel-request.json", task_id))
+        task = answer["result"]
+        assert task["status"]["state"] == protocol.STATE_WORKING and task["metadata"]["artifactbridge.cancel"] == "pending"
+    # Still occupied: the row is running, the task keeps its dlc_, and no cancel_acknowledged went out.
+    assert [r["state"] for r in journaled(journal_path)] == ["running"]
+    assert listener.credentials.lookup(POOL_PLATFORM, CONTEXT, task_id) is not None
+    assert [r["kind"] for r in server.reports] == ["running"]
+    listener.model.release.set()
+    settle(listener, task_id)
+    _, got = listener.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task_id))
+    assert got["result"]["status"]["state"] == protocol.STATE_COMPLETED
+    assert server.reports[-1] == report_body(envelope()["binding"], 2, "stopped", "completed")
+
+
+def test_a_finished_task_is_not_cancelable(listener, server):
+    server.issue(envelope())
+    _, sent = listener.call("cloud-send-request.json")
+    settle(listener, task_of(sent)["id"])
+    _, answer = listener.call("cloud-cancel-request.json", body=with_id("cloud-cancel-request.json", task_of(sent)["id"]))
+    assert answer["error"]["code"] == protocol.ERR_TASK_NOT_CANCELABLE and len(server.reports) == 2
+
+
+# ---- restart recovery ----
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")  # the crash abandons the turn
+def test_after_a_restart_get_list_and_cancel_recover_by_grant_and_nothing_respawns(listeners, server, journal_path):
+    first = listeners()
+    first.model.behavior[0] = "block"
+    server.issue(envelope())
+    _, sent = first.call("cloud-send-request.json")
+    task_id = task_of(sent)["id"]
+    wait_for(first.model.started[0])
+    first.crash()  # with the turn in flight
+
+    second = listeners()
+    assert [r["state"] for r in journaled(journal_path)] == ["uncertain"]
+    # The restarted process holds no agx_: the crash report waits for the server's next request.
+    assert [r["kind"] for r in server.reports] == ["running"]
+
+    other_agx, other_journal = grant_for(envelope(binding={"assignmentId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000042"}))
+    foreign = {**SEND["headers"], "x-ab-control-credential": other_agx, "x-ab-start-journal-id": other_journal}
+    _, unknown = second.call("cloud-get-task-request.json", headers=foreign,
+                             body=with_id("cloud-get-task-request.json", task_id))
+    assert unknown["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+    _, listed = second.call("cloud-list-tasks-request.json", headers=foreign)
+    assert listed["result"]["tasks"] == [] and [r["kind"] for r in server.reports] == ["running"]
+
+    _, got = second.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task_id))
+    assert (got["result"]["id"], got["result"]["status"]["state"]) == (task_id, protocol.STATE_FAILED)
+    assert got["result"]["metadata"] == sent["result"]["task"]["metadata"]
+    assert server.reports[-1] == report_body(envelope()["binding"], 2, "stopped", "crashed")
+    _, listed = second.call("cloud-list-tasks-request.json")
+    assert [t["id"] for t in listed["result"]["tasks"]] == [task_id]
+    _, canceled = second.call("cloud-cancel-request.json", body=with_id("cloud-cancel-request.json", task_id))
+    assert canceled["error"]["code"] == protocol.ERR_TASK_NOT_CANCELABLE
+    _, resent = second.call("cloud-send-request.json")  # an ambiguous Send's replay never respawns
+    assert task_of(resent)["status"]["state"] == protocol.STATE_FAILED and second.model.turns == []
+    assert len(server.starts) == 1 and len(server.bootstraps) == 1
