@@ -1,0 +1,22 @@
+{
+  "method": "POST",
+  "url": "https://runner.example.invalid/a2a/jsonrpc",
+  "headers": {
+    "a2a-version": "1.0",
+    "accept": "application/json",
+    "authorization": "Bearer RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR",
+    "content-type": "application/json",
+    "x-ab-control-credential": "agx_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "x-ab-pool-protocol-version": "1",
+    "x-ab-start-journal-id": "agj_6f1f7d9e0a1b4c2d8e3f000000000004"
+  },
+  "body": {
+    "jsonrpc": "2.0",
+    "method": "CancelTask",
+    "params": {
+      "id": "remote-task-1",
+      "metadata": {}
+    },
+    "id": 4
+  }
+}

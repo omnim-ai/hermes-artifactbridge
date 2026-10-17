@@ -1,0 +1,20 @@
+{
+  "jsonrpc": "2.0",
+  "id": "00000000-0000-4000-8000-000000000000",
+  "result": {
+    "protocolVersion": 1,
+    "executorId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000005",
+    "executorConnectionRevision": "1",
+    "nonce": "NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN",
+    "capabilities": [
+      "assignment_tuple_start_ownership",
+      "scoped_space_document_skill",
+      "per_task_credentials_fresh_sessions",
+      "same_session_continuation",
+      "durable_inspect_recovery",
+      "cancel_report_fencing",
+      "cloud_start_headers_v1"
+    ],
+    "runtimeVersion": "0.0.0-fixture"
+  }
+}

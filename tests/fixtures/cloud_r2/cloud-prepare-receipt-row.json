@@ -1,0 +1,18 @@
+{
+  "workspace_id": "6f1f7d9e-0a1b-4c2d-8e3f-000000000001",
+  "service_id": "6f1f7d9e-0a1b-4c2d-8e3f-000000000002",
+  "delegation_id": "6f1f7d9e-0a1b-4c2d-8e3f-000000000003",
+  "execution_generation": 1,
+  "assignment_id": "6f1f7d9e-0a1b-4c2d-8e3f-000000000004",
+  "executor_id": "6f1f7d9e-0a1b-4c2d-8e3f-000000000005",
+  "slot_id": "6f1f7d9e-0a1b-4c2d-8e3f-000000000006",
+  "reservation_generation": "1",
+  "executor_connection_revision": "1",
+  "dispatch_id": "dispatch-1",
+  "command_sequence": 1,
+  "setup_revision": 1,
+  "start_by": "2026-10-17T12:00:00.000Z",
+  "start_journal_id": "agj_6f1f7d9e0a1b4c2d8e3f000000000004",
+  "sealed_control_credential": "SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS",
+  "control_credential_hash": "f0571dc1ae27ff3038aa88588b47f8973fbe21ee7c373fbf84d8573ac8a68985"
+}

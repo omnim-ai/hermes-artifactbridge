@@ -1,0 +1,59 @@
+{
+  "method": "POST",
+  "url": "https://runner.example.invalid/a2a/jsonrpc",
+  "headers": {
+    "a2a-version": "1.0",
+    "accept": "application/json",
+    "authorization": "Bearer RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR",
+    "content-type": "application/json",
+    "x-ab-control-credential": "agx_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    "x-ab-pool-protocol-version": "1",
+    "x-ab-start-journal-id": "agj_6f1f7d9e0a1b4c2d8e3f000000000007"
+  },
+  "body": {
+    "jsonrpc": "2.0",
+    "method": "SendMessage",
+    "params": {
+      "message": {
+        "messageId": "dispatch-2",
+        "contextId": "abc-context-1",
+        "role": "ROLE_USER",
+        "parts": [
+          {
+            "text": "ArtifactBridge delegation 6f1f7d9e-0a1b-4c2d-8e3f-000000000003, generation 2.",
+            "metadata": {},
+            "mediaType": "text/plain"
+          }
+        ],
+        "metadata": {}
+      },
+      "configuration": {
+        "acceptedOutputModes": [
+          "text/plain"
+        ],
+        "returnImmediately": true
+      },
+      "metadata": {
+        "artifactbridge.assignment": {
+          "protocolVersion": 1,
+          "binding": {
+            "workspaceId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000001",
+            "serviceId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000002",
+            "delegationId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000003",
+            "executionGeneration": 2,
+            "assignmentId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000007",
+            "executorId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000005",
+            "slotId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000006",
+            "reservationGeneration": "2",
+            "executorConnectionRevision": "1"
+          },
+          "dispatchId": "dispatch-2",
+          "commandSequence": 1,
+          "setupRevision": 1,
+          "startBy": "2026-10-17T12:00:00.000Z"
+        }
+      }
+    },
+    "id": 1
+  }
+}
