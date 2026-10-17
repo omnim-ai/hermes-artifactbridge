@@ -268,6 +268,12 @@ Contract ambiguities, as implemented:
 - The `send` override that resolves only the task named by `reply_to` is
   unit-tested against the stock adapter class but not proven in a live gateway
   turn.
+- Pooled requests do not increment the stock A2A `inbound_total` metric:
+  rebinding that Hermes module attribute fails `hermes plugins validate`.
+  Validation passes, but it warns about private core imports
+  (`plugins.platforms.a2a.*`, `gateway.session_context`,
+  `hermes_cli.plugins_manifest`). They are inherent to subclassing the stock
+  adapter, which is why the runtime shape and version gate exist.
 
 **Not proven.** No pooled journey has run against a real ArtifactBridge server
 or a live Hermes gateway. The tests use a fake control server and a fake

@@ -107,7 +107,7 @@ def build_adapter_class():
             framed = security.wrap_inbound(peer, text)
             security.audit("inbound", peer, task_id, text)
             protocol.persist_message(context_id, "user", text, task_id)
-            protocol.metrics.inbound_total += 1
+            # No stock inbound_total increment: rebinding a Hermes module attribute fails `hermes plugins validate`.
             self._register_inline_push(task_id, params, agent=agent)
             fut = self._add_pending(task_id, context_id)
             event = MessageEvent(text=framed, message_type=MessageType.TEXT, message_id=task_id,
