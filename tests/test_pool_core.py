@@ -193,6 +193,21 @@ def test_a_valid_permit_replayed_after_start_by_does_not_spawn(core, server, clo
     assert len(server.starts) == 1 and server.bootstraps == [] and server.reports == []
 
 
+def test_start_by_passing_during_bootstrap_refuses_without_spawning(core, server, clock, journal_path):
+    server.on_bootstrap = lambda body: clock.advance(minutes=10)  # the credential arrives exactly at startBy
+    metadata = server.issue(envelope())
+    decision = core.admit(metadata, CTX, "task-1")
+    assert (decision.kind, decision.outcome) == ("terminal", REJECTED) and "start_deadline_passed" in decision.text
+    assert core.credentials._bound == {} and len(server.issued) == 1
+    assert [(r["state"], r["refusal"], r["result_state"]) for r in rows(journal_path)] == [
+        ("refused", "start_deadline_passed", None)]
+    assert server.reports == [report_body(envelope()["binding"], 1, "stopped", "failed")]
+
+    again = core.admit(metadata, CTX, "task-2")
+    assert (again.kind, again.outcome, again.text) == ("terminal", REJECTED, decision.text)
+    assert len(server.starts) == len(server.bootstraps) == 1 and len(server.reports) == 1
+
+
 @pytest.mark.parametrize("tamper", [{"setupRevision": 2}, {"startJournalId": "journal-other"},
                                     {"startBy": "2026-10-18T12:00:00.000Z"}, {"extra": 1}])
 def test_a_permit_differing_from_the_journaled_envelope_is_refused(core, server, tamper):

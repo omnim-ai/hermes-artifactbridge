@@ -102,6 +102,8 @@ class PoolControl:
         return credential
 
     def report(self, body: dict) -> bool:
+        """Provisional, pending server route (U2/U4), gap G4: the server's report transport is RPC-only
+        (agent_gateway_pooled_report). A failed report is logged and not retried (no outbox)."""
         try:
             self._post(REPORT_PATH, body)
         except ControlUnavailable as exc:
@@ -239,6 +241,10 @@ class PoolCore:
             logger.warning("artifactbridge pooled bootstrap unavailable: %s", exc)
             self.finish(task_id, FAILED, refusal_text("bootstrap_unavailable"))
             return Decision("terminal", row["context_id"], outcome=FAILED, text=refusal_text("bootstrap_unavailable"))
+        if self._now() >= start_by:  # bootstrap can outlast startBy; the unbound credential is discarded
+            self._end(task_id, FAILED, "", kind="stopped", refusal="start_deadline_passed")
+            with self.journal.tx() as tx:
+                return self._terminal(tx.get(key))
         with self.journal.tx() as tx:
             spawned = tx.update(key, from_states=("permitted",), state="spawned")
             current = tx.get(key)
@@ -285,14 +291,18 @@ class PoolCore:
         """Cancel a live pooled turn: cancel_acknowledged with its own binding; drops its credential."""
         return self._end(task_id, CANCELED, "", kind="cancel_acknowledged")
 
-    def _end(self, task_id: str, outcome: str, text: str, *, kind: str) -> bool:
+    def _end(self, task_id: str, outcome: str, text: str, *, kind: str, refusal: str | None = None) -> bool:
+        """``refusal`` ends a permitted, never-spawned row as refused; it still reports, as it held a permit."""
         with self._lock:
             key = self._live.get(task_id)
         if key is None:
             return False
         with self.journal.tx() as tx:
-            ended = tx.update(key, from_states=("permitted", "spawned"), state="finished", result_state=outcome,
-                              result_text=text)
+            if refusal:
+                ended = tx.update(key, from_states=("permitted",), state="refused", refusal=refusal)
+            else:
+                ended = tx.update(key, from_states=("permitted", "spawned"), state="finished", result_state=outcome,
+                                  result_text=text)
             sequence = tx.next_report_sequence(key) if ended else None
             row = tx.get(key)
         self.credentials.drop(POOL_PLATFORM, row["context_id"], task_id)

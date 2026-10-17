@@ -210,7 +210,9 @@ through the same profile-scoped reader as the service credential.
   mismatched start permit, or a passed `startBy` ends the A2A task as
   rejected/failed before any message reaches Hermes. Only after a valid permit
   does the plugin bootstrap a per-task `dlc_` credential, held in memory for
-  that (platform, contextId, task id) only.
+  that (platform, contextId, task id) only. `startBy` is checked again after
+  bootstrap: if it has passed, the credential is discarded, the dispatch is
+  refused `start_deadline_passed` and reported `stopped`/`failed`.
 - **Pooled tools.** Toolset `artifactbridge-pool` holds token-free
   `artifactbridge_pool_*` variants of the eleven tools (same server tools on the
   wire). They present only the current task's `dlc_` as `Authorization: Bearer`,
@@ -246,10 +248,26 @@ is not final:
   the start request body.
 - G3: the bootstrap response is assumed to be
   `{"credential": "dlc_...", "expiresAt": "<iso>"}`.
+- G4: report and cancel-ack transport is RPC-only on the server
+  (`agent_gateway_pooled_report`). The plugin POSTs the fixture bodies to the
+  provisional `/api/agent-gateway/pool/report` path; a failed report is logged
+  and not retried (there is no outbox).
 - G5: `capability_proof(challenge)` answers a capability challenge as a pure
   function (only when pooled mode is fully configured); no network channel for
   the challenge is specified, so none exists.
-- G4 was not specified to this implementation.
+
+Contract ambiguities, as implemented:
+
+- `dispatchId` is treated as globally unique within the journal: a second
+  assignment reusing an existing `dispatchId` with a different envelope is
+  refused `tuple_mismatch`.
+- After a crash between permit and spawn, the row returns to `start_requested`
+  and a retry bootstraps a new `dlc_`.
+- The pooled listener does not apply the stock adapter's per-context anti-loop
+  turn counter.
+- The `send` override that resolves only the task named by `reply_to` is
+  unit-tested against the stock adapter class but not proven in a live gateway
+  turn.
 
 **Not proven.** No pooled journey has run against a real ArtifactBridge server
 or a live Hermes gateway. The tests use a fake control server and a fake

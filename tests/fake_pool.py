@@ -72,6 +72,7 @@ class FakeControl:
     bootstrap_fails: bool = False
     redirect: bool = False
     on_start: Callable[[dict], None] | None = None
+    on_bootstrap: Callable[[dict], None] | None = None
 
     def issue(self, env: dict) -> dict:
         """Dispatch ``env`` server-side; returns the A2A request metadata carrying it."""
@@ -97,6 +98,8 @@ class FakeControl:
             return self._start(body)
         if path == BOOTSTRAP_PATH:
             self.bootstraps.append(body)
+            if self.on_bootstrap:
+                self.on_bootstrap(body)
             if self.bootstrap_fails:
                 return httpx2.Response(503)
             credential = "dlc_" + secrets.token_urlsafe(32)
