@@ -39,6 +39,14 @@ _CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")  # a refusal or error code: con
 _DLC_RE = re.compile(r"^dlc_[A-Za-z0-9_-]{32,}$")
 _AGX_RE = re.compile(r"^agx_[A-Za-z0-9_-]{32,}$")
 _JOURNAL_RE = re.compile(r"^[\x20-\x7e]{1,128}$")  # printable ASCII, no control characters
+# Anywhere in text, the agx_/dlc_ shapes above; Hermes' egress scrub (security.redact_outbound) knows neither.
+_CREDENTIAL_IN_TEXT_RE = re.compile(r"(?:agx|dlc)_[A-Za-z0-9_-]{32,}")
+
+
+def redact_credentials(text: str) -> str:
+    """``text`` with every agx_/dlc_-shaped value replaced, as Hermes' own scrub writes ``[redacted]``."""
+    return _CREDENTIAL_IN_TEXT_RE.sub("[redacted]", text)
+
 
 # Only what this plugin implements; the proof is separate from open-pool consent, which the plugin never
 # claims or sets. ``same_session_continuation`` is withdrawn (product ruling 2026-10-17; AI-4105): a probe

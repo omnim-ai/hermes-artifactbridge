@@ -301,21 +301,22 @@ def test_a_cloud_terminal_commits_with_its_failed_result_and_stopped_report_and_
     core.started("task-1")
     other = {"reason": "clarification_unsupported", "question": "Which colour?"}
     callbacks = [("asked", ASKED), ("asked", ASKED), ("other", other)]  # identical retries and a conflicting one
-    barrier = threading.Barrier(len(callbacks))
+    barrier, wins = threading.Barrier(len(callbacks)), []
 
     def finish(text, terminal):
         barrier.wait()
-        core.finish("task-1", FAILED, text, terminal=terminal)
+        wins.append((core.finish("task-1", FAILED, text, terminal=terminal), text))
 
     threads = [threading.Thread(target=finish, args=c) for c in callbacks]
     for t in threads:
         t.start()
     for t in threads:
         t.join(10)
-    core.finish("task-1", FAILED, "later", terminal=other)  # a late callback after the first terminal
+    assert core.finish("task-1", FAILED, "later", terminal=other) is False  # a late callback after the terminal
     row = rows(journal_path)[0]
     won = json.loads(row["cloud_terminal"])
     assert (won, row["result_text"]) in ((ASKED, "asked"), (other, "other"))  # one callback's pair, never mixed
+    assert [text for ended, text in wins if ended] == [row["result_text"]]  # only the winner learns it won
     assert (row["state"], row["result_state"]) == ("finished", FAILED)
     assert pending(journal_path) == [[(1, "running"), (2, "stopped")]]  # one stopped report, in the same commit
     assert json.loads(row["pending_reports"])[1] == report_body(envelope()["binding"], 2, "stopped", "failed")

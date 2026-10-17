@@ -18,7 +18,8 @@ import threading
 import time
 
 from .pool_core import CANCELED, COMPLETED, FAILED, POOL_PLATFORM, REJECTED, Decision, clarification, refusal_text
-from .pool_protocol import CAPABILITY_METHOD, METADATA_KEY, TERMINAL_KEY, Refused, capability_answer, pool_grant
+from .pool_protocol import (CAPABILITY_METHOD, METADATA_KEY, TERMINAL_KEY, Refused, capability_answer, pool_grant,
+                            redact_credentials)
 
 logger = logging.getLogger(__name__)
 
@@ -328,27 +329,42 @@ def build_adapter_class():
         def _finalize_task(self, pending, state, reply):
             """The journal first: the row's result, cloudTerminal and report commit in one transaction before
             the stock finalizer's volatile TaskStore, persistence, audit and push, so Get/List after a crash or
-            a lost response answer from the journal. A clarification cannot be continued (AI-4105): the task
-            fails with ``artifactbridge.cloudTerminal`` and the server, not this runner, posts the question."""
+            a lost response answer from the journal. Only the callback whose result the journal committed (the
+            first) reaches the stock finalizer; a duplicate, or a result the journal could not commit, publishes
+            nothing. A clarification cannot be continued (AI-4105): the task fails with
+            ``artifactbridge.cloudTerminal`` and the server, not this runner, posts the question."""
             task_id = pending["task_id"]
             timed_out = not pending["future"].done()  # the stock wait gave up: the turn's stop is unknown
-            reply = security.redact_outbound(reply or "")
+            reply = redact_credentials(security.redact_outbound(reply or ""))
             stripped, terminal = reply.lstrip(), None
             if state == protocol.STATE_COMPLETED and stripped.upper().startswith(protocol.INPUT_REQUIRED_MARKER):
                 state = protocol.STATE_FAILED
                 reply, terminal = clarification(stripped[len(protocol.INPUT_REQUIRED_MARKER):])
             try:  # only this task's own row; a replaced row is left untouched and unreported
                 if state == protocol.STATE_CANCELED and task_id in self._cancel_requested:
-                    self._core.cancel(task_id)
+                    committed = self._core.cancel(task_id)
                 else:
-                    self._core.finish(task_id, core_outcome.get(state, FAILED), reply, terminal=terminal,
-                                      timed_out=timed_out)
+                    committed = self._core.finish(task_id, core_outcome.get(state, FAILED), reply,
+                                                  terminal=terminal, timed_out=timed_out)
+            except Exception as exc:  # nothing committed: Get/List keep answering the journal's last state
+                logger.warning("artifactbridge pooled result not journaled: %s", type(exc).__name__)
+                self._core.credentials.drop(POOL_PLATFORM, pending["context_id"], task_id)  # the turn is over
+                committed = False
+            try:
+                if committed:
+                    state, reply = super()._finalize_task(pending, state, reply)
             finally:
-                state, reply = super()._finalize_task(pending, state, reply)
+                self._pop_pending(task_id)
                 self._cancel_requested.discard(task_id)
                 for live in (self._events, self._admitted, self._finalizers):
                     live.pop(task_id, None)
             return state, reply
+
+        async def send_final_ledgered(self, event, session_key, text_content, metadata, **kwargs):
+            """A pooled turn's final reply, before the stock delivery ledger (state.db) records it: no
+            agx_/dlc_-shaped value, which Hermes' own scrub does not know."""
+            return await super().send_final_ledgered(event, session_key, redact_credentials(text_content), metadata,
+                                                     **kwargs)
 
         async def send(self, chat_id, content, reply_to=None, metadata=None):
             """The final reply resolves exactly the task it answers (``reply_to`` is the A2A task id), so a

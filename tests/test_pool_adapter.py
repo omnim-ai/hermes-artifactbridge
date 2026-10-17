@@ -3,9 +3,11 @@ Hermes message pipeline (skipped without Hermes). Requests are the generated clo
 (tests/fixtures/cloud_r2), sent to the listener's real ``connect()`` socket with the server's headers; only
 the model (``_message_handler``) and the server's control routes (FakeControl) are stand-ins."""
 import asyncio
+import contextlib
 import copy
 import http.client
 import json
+import sqlite3
 import threading
 import urllib.parse
 
@@ -76,7 +78,7 @@ def server():
 class Model:
     """The stand-in model behind Hermes' real message pipeline. ``behavior`` maps the A2A task id's turn
     number (0, 1, ...) to ``"block"`` (wait until released or canceled), ``"stubborn"`` (ignore a cancel
-    until released) or a reply text (default "done")."""
+    until released), a reply text (default "done") or a function of the turn's bound dlc_ returning one."""
 
     def __init__(self, credentials):
         self.credentials = credentials
@@ -101,7 +103,7 @@ class Model:
                 except asyncio.CancelledError:
                     continue
             return "done after all"
-        return behavior
+        return behavior(self.seen_credentials[n]) if callable(behavior) else behavior
 
 
 class Listener:
@@ -446,20 +448,30 @@ def test_concurrent_duplicate_sends_run_one_turn_and_answer_one_task(listener, s
     assert len({task_of(a)["id"] for _, a in answers}) == 1 and len(answers) == 4
 
 
-@pytest.mark.parametrize("reply", ["done", "[INPUT_REQUIRED] Which tone?"], ids=["completed", "clarification"])
+@pytest.mark.parametrize("reply, shown", [
+    ("done", "done"),
+    ("[INPUT_REQUIRED] Which tone?", "Which tone?"),
+    (lambda dlc: f"Keys: {AGX} and {dlc}.", "Keys: [redacted] and [redacted]."),  # the turn leaks its own
+    (lambda dlc: f"[INPUT_REQUIRED] Is it {AGX} or {dlc}?", "Is it [redacted] or [redacted]?"),
+], ids=["completed", "clarification", "completed-echoing-credentials", "clarification-echoing-credentials"])
 def test_no_secret_reaches_the_model_tasks_journal_logs_or_answers(listener, server, journal_path, tmp_path, caplog,
-                                                                   reply):
+                                                                   reply, shown):
     listener.model.behavior[0] = reply
     server.issue(envelope())
     _, sent = listener.call("cloud-send-request.json")
     task_id = task_of(sent)["id"]
     settle(listener, task_id)
-    answers = [sent, listener.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task_id))[1],
-               listener.call("cloud-list-tasks-request.json")[1]]
+    _, got = listener.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task_id))
+    _, listed = listener.call("cloud-list-tasks-request.json")
+    for task in (got["result"], *listed["result"]["tasks"]):  # the reply is visible, its credentials are not
+        assert _text(task).endswith(shown)
+        assert task["metadata"].get(CLOUD_TERMINAL, {}).get("question") in (None, shown)
+    answers = [sent, got, listed]
     blob = (json.dumps(answers) + listener.model.turns[0].text + repr(listener.adapter.tasks.list())
             + caplog.text).encode()
     blob += b"".join(p.read_bytes() for p in tmp_path.rglob("*") if p.is_file())  # journal, audit, history
     assert [s for s in SECRETS if s in blob] == []
+    assert listener.model.seen_credentials[0].startswith("dlc_")  # the turn held, and could echo, a real dlc_
 
 
 # ---- clarification and continuation ----
@@ -574,6 +586,100 @@ def test_a_turn_the_runtime_never_answered_reports_timed_out_never_a_confirmed_s
     assert got["result"]["status"]["state"] == protocol.STATE_FAILED
     assert CLOUD_TERMINAL not in got["result"]["metadata"]
     assert server.reports[-1] == report_body(BINDING, 2, "stopped", "timed_out")
+
+
+def _published(listener, monkeypatch) -> list:
+    """Observes the stock finalizer's publish step (persist, audit, metrics, TaskStore, push) as (state, reply)."""
+    published, record = [], listener.adapter._record_outcome
+    monkeypatch.setattr(listener.adapter, "_record_outcome",
+                        lambda *args, **kwargs: (published.append(args[3:5]), record(*args, **kwargs)))
+    return published
+
+
+def _running(listener, server) -> tuple[str, object]:
+    """A sent task whose turn blocks until released; returns its id and its finalizer thread."""
+    listener.model.behavior[0] = "block"
+    server.issue(envelope())
+    _, sent = listener.call("cloud-send-request.json")
+    task_id = task_of(sent)["id"]
+    return task_id, listener.adapter._finalizers[task_id]
+
+
+def _journal_fails(journal_path, when: str):
+    """The database aborts every dispatches update matching ``when`` (as a full disk would)."""
+    db = sqlite3.connect(journal_path, isolation_level=None)
+    db.execute(f"CREATE TRIGGER journal_fails BEFORE UPDATE ON dispatches WHEN {when} "
+               "BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END")
+    return contextlib.closing(db)
+
+
+def test_a_result_the_journal_could_not_commit_is_never_published_and_get_answers_the_journal(
+        listener, server, journal_path, monkeypatch):
+    published = _published(listener, monkeypatch)
+    task_id, finalizer = _running(listener, server)
+    with _journal_fails(journal_path, "NEW.state = 'finished'") as db:  # the result's transaction aborts
+        listener.model.release.set()
+        finalizer.join(TURN_BOUND)
+        db.execute("DROP TRIGGER journal_fails")
+    assert published == [] and listener.adapter.tasks.get(task_id)["state"] == protocol.STATE_WORKING
+    assert [r["state"] for r in journaled(journal_path)] == ["running"] and [r["kind"] for r in server.reports] == [
+        "running"]
+    assert listener.adapter._pending == {} and task_id not in listener.adapter._finalizers
+    assert listener.credentials.lookup(POOL_PLATFORM, CONTEXT, task_id) is None  # the turn is over
+    _, got = listener.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task_id))
+    assert got["result"]["status"]["state"] == protocol.STATE_WORKING  # the journal's state, never a guess
+
+
+def test_a_committed_result_whose_report_ack_cannot_be_written_is_still_published_once(
+        listener, server, journal_path, monkeypatch):
+    published = _published(listener, monkeypatch)
+    task_id, finalizer = _running(listener, server)
+    # Only an acknowledgment (a shorter pending list) aborts: the result and its report commit first.
+    with _journal_fails(journal_path, "length(coalesce(NEW.pending_reports, '')) < "
+                                      "length(coalesce(OLD.pending_reports, '')) AND OLD.state = 'finished'") as db:
+        listener.model.release.set()
+        finalizer.join(TURN_BOUND)
+        db.execute("DROP TRIGGER journal_fails")
+    assert published == [(protocol.STATE_COMPLETED, "done")]
+    row, = journaled(journal_path)
+    assert (row["state"], [r["kind"] for r in json.loads(row["pending_reports"])]) == ("finished", ["stopped"])
+    _, got = listener.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task_id))
+    assert got["result"]["status"]["state"] == protocol.STATE_COMPLETED
+    # Recorded once; the unacknowledged copy is replayed (recorded: false) and then leaves the journal.
+    assert [r["kind"] for r in server.reports] == ["running", "stopped"]
+    assert [r["kind"] for r in server.replays] == ["stopped"] and journaled(journal_path)[0]["pending_reports"] is None
+
+
+def test_conflicting_duplicate_finalizer_callbacks_publish_only_the_journaled_winner_once(
+        listener, server, journal_path, monkeypatch):
+    published, finalize = _published(listener, monkeypatch), listener.adapter._finalize_task
+    results = [(protocol.STATE_COMPLETED, "done"), (protocol.STATE_COMPLETED, "done"),
+               (protocol.STATE_COMPLETED, "[INPUT_REQUIRED] Which tone?"), (protocol.STATE_FAILED, "boom")]
+    barrier = threading.Barrier(len(results))
+
+    def duplicated(pending, state, reply):  # the runtime's one answer arrives as identical and conflicting copies
+        def one(result):
+            barrier.wait()
+            finalize(pending, *result)
+        threads = [threading.Thread(target=one, args=(result,)) for result in results]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(TURN_BOUND)
+
+    monkeypatch.setattr(listener.adapter, "_finalize_task", duplicated)
+    task_id, finalizer = _running(listener, server)
+    listener.model.release.set()
+    finalizer.join(TURN_BOUND)
+    row, = journaled(journal_path)
+    won = ({"completed": protocol.STATE_COMPLETED, "failed": protocol.STATE_FAILED}[row["result_state"]],
+           row["result_text"])
+    assert published == [won]  # one stock publish, and it is the journal's winner
+    record = listener.adapter.tasks.get(task_id)
+    assert (record["state"], record["reply"]) == won
+    _, got = listener.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task_id))
+    assert got["result"]["status"]["state"] == won[0]
+    assert [r["kind"] for r in server.reports] == ["running", "stopped"] and listener.adapter._pending == {}
 
 
 def test_the_fixture_continuation_after_a_clarification_is_rejected_with_no_turn_session_or_control_call(

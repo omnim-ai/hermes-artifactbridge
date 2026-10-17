@@ -297,9 +297,18 @@ server's requests (see Start headers).
   fails with the generic `outcome_too_long` and no cloudTerminal. The result
   and its cloudTerminal are journaled with the `stopped`/`failed` report in one
   transaction, before the in-memory task store; the first result wins, and
-  Get, List and a repeated Send answer it, also after a restart. A turn whose
-  reply never arrived (Hermes' `A2A_REPLY_TIMEOUT`) is reported
+  Get, List and a repeated Send answer it, also after a restart. Only that
+  first result reaches Hermes' task store, A2A history, audit and push; a
+  duplicate publishes nothing, and a result the journal could not commit is
+  never published (Get and List keep answering the journal's last state). A
+  turn whose reply never arrived (Hermes' `A2A_REPLY_TIMEOUT`) is reported
   `stopped`/`timed_out`, never a confirmed failure.
+- **Credentials in replies.** Hermes' egress scrub does not know `agx_` or
+  `dlc_` values, so the plugin replaces any `agx_`/`dlc_`-shaped value in a
+  pooled turn's final reply with `[redacted]` before Hermes' delivery ledger
+  records it, and again before the journal, task store, history, audit,
+  answers and the cloudTerminal question. The agent's own session transcript
+  is written by Hermes before the reply reaches the plugin and is not covered.
 - **Sessions.** Continuations are not supported (native support is tracked as
   AI-4105). Every continuation (a higher execution generation, or another
   assignment of a delegation already journaled) is rejected

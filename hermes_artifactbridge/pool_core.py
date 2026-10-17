@@ -443,13 +443,13 @@ class PoolCore:
         return running
 
     def finish(self, task_id: str, outcome: str, text: str, *, terminal: dict | None = None,
-               timed_out: bool = False) -> None:
+               timed_out: bool = False) -> bool:
         """Record a turn's result (and its cloudTerminal) on its OWN row only, in the transaction that queues
-        its stopped report; the first result wins, and a row already ended (canceled, replaced) stays as it
-        is and gets no further report. ``timed_out``: the runtime never answered, so its stop is unknown and
-        the report says ``timed_out``, never ``failed``."""
-        self._end(task_id, outcome, text, kind="stopped", terminal=terminal,
-                  report_outcome="timed_out" if timed_out else None)
+        its stopped report; True only for the first result, which wins. A row already ended (canceled,
+        replaced) stays as it is and gets no further report. ``timed_out``: the runtime never answered, so its
+        stop is unknown and the report says ``timed_out``, never ``failed``."""
+        return self._end(task_id, outcome, text, kind="stopped", terminal=terminal,
+                         report_outcome="timed_out" if timed_out else None)
 
     def cancel(self, task_id: str) -> bool:
         """A confirmed stop of a live pooled turn: cancel_acknowledged with its own binding; drops its
@@ -477,7 +477,10 @@ class PoolCore:
         with self._lock:
             self._live.pop(task_id, None)
         if ended:
-            self.deliver_reports()
+            try:  # the result is committed whatever delivery does; an undelivered report stays journaled
+                self.deliver_reports()
+            except Exception as exc:
+                logger.warning("artifactbridge pooled report replay failed: %s", type(exc).__name__)
         return ended
 
     def deliver_reports(self) -> None:
