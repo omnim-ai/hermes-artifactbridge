@@ -148,6 +148,14 @@ def test_every_request_is_intercepted_before_any_model_invocation(adapter, serve
     assert adapter.tasks.get(task["id"])["state"] == protocol.STATE_REJECTED
 
 
+def test_a_cloud_assignment_the_server_did_not_start_never_reaches_the_model(adapter, server, credentials):
+    server.cloud = True  # the server lifecycle owns cloud start; an unknown journal gets start_not_authorized
+    task = send(adapter, server.issue(envelope()), CTX)
+    assert state(task) == protocol.STATE_REJECTED and "start_not_authorized" in json.dumps(task)
+    assert adapter.turns == [] and adapter._pending == {} and credentials._bound == {}
+    assert len(server.starts) == 1 and server.bootstraps == [] and server.reports == []
+
+
 def test_a_permitted_dispatch_runs_once_with_its_own_binding_and_reports_completion(adapter, server, credentials):
     metadata = server.issue(envelope())
     task = send(adapter, metadata, CTX)

@@ -28,10 +28,10 @@ provides_tools:
 # Pooled mode only (ARTIFACTBRIDGE_POOL_ENABLED=1 and the executor settings below): the plugin also registers
 # the `artifactbridge-pool` platform and the token-free `artifactbridge_pool_*` variants of the eleven tools
 # (toolset `artifactbridge-pool`). They are not listed above because an unconfigured install never registers them.
-# Pooled control routes are provisional, pending server route (U2/U4).
+# Pooled control routes follow artifact-forge c0b4de56c, which is not merged or deployed (see README).
 optional_env:
   - name: ARTIFACTBRIDGE_POOL_ENABLED
-    description: "Set to 1 to opt in to pooled (assignment-bound) execution, protocol v1. Off by default: its control routes are provisional, pending server route (U2/U4)."
+    description: "Set to 1 to opt in to pooled (assignment-bound) execution, protocol v1. Off by default: its server routes are not deployed yet (see README)."
     prompt: "Enable ArtifactBridge pooled execution (1 or empty)"
     password: false
   - name: ARTIFACTBRIDGE_POOL_EXECUTOR_CREDENTIAL

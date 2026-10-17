@@ -89,7 +89,7 @@ def _pool_setting(name: str) -> str:
 
 
 def _pool_configured() -> bool:
-    """Pooled execution is opt-in and off by default: its control routes are provisional (G2)."""
+    """Pooled execution is opt-in and off by default: its server routes are not deployed yet (README GAP-A/B)."""
     return (_pool_setting(POOL_ENABLED_ENV) == "1" and _pool_setting(POOL_CREDENTIAL_ENV).startswith("agx_")
             and is_uuid(_pool_setting(POOL_EXECUTOR_ID_ENV)) and is_bigint_string(_pool_setting(POOL_REVISION_ENV))
             and is_trusted_url(_tools_url()))

@@ -180,7 +180,7 @@ and [plugin tools](https://hermes-agent.nousresearch.com/docs/developer-guide/pl
 Removing the plugin does not revoke enrollment: rotate or disable the service
 in ArtifactBridge separately.
 
-## Pooled execution (protocol v1, provisional)
+## Pooled execution (protocol v1, not yet usable against a deployed server)
 
 Pooled (assignment-bound) execution lets ArtifactBridge dispatch one exact
 assignment to this executor instead of putting a `dlt_` token in the task
@@ -234,35 +234,62 @@ through the same profile-scoped reader as the service credential.
   startJournalId. When the adapter starts, a dispatch that was running when the
   process stopped is marked `uncertain` and reported `stopped`/`crashed`; it is
   never re-run, and a later retry answers failed/uncertain.
+- **Durable reports.** Each `running`, `stopped` and `cancel_acknowledged`
+  report is written to the journal row (`pending_reports`) in the same
+  transaction that allocates its `reportSequence` and makes the state change,
+  then sent outside it, each row's oldest sequence first. A report leaves the
+  journal only when the server answers `{recorded, currentOccupant}`, including
+  `recorded: false` (a replay of a recorded sequence). `scheduler_busy` is
+  retried twice inline (0.05 s, 0.2 s); any other failure leaves the report
+  pending, and the next `admit` (after its own start path), `finish`, `cancel`
+  or adapter start sends it, at most 8 per pass and stopping at the first
+  failure. A named refusal is recorded in `report_refusal` and never retried.
 - **Cancel.** `tasks/cancel` sends `cancel_acknowledged` with that task's own
   binding and drops its credential. A late result from a canceled turn changes
   only its own row and never reports for a newer assignment.
 
-**Provisional, pending server route (U2/U4).** This follows the ArtifactBridge
-U3 checkpoint (fixtures in `tests/fixtures/pooled_v1`, see `SOURCE.md`), which
-is not final:
+**Server contract.** Routes and shapes match artifact-forge
+`src/routes/agent-gateway-pool.ts` at `c0b4de56c` and the integration-u3-r1
+fixtures in `tests/fixtures/pooled_v1` (see `SOURCE.md`). That server code is
+not merged or deployed. Calls go to `POST /api/agent-gateway/pool/start`,
+`/bootstrap` and `/report` and to `GET`/`POST /api/agent-gateway/pool/capability`
+on the tools URL's origin with `Authorization: Bearer agx_...`; redirects are
+never followed. Status mapping: a contract 409 refusal (`start_owned`,
+`start_deadline_passed`, `start_not_authorized`, `withdrawn`, any named error
+code) and 401/403/400 are terminal refusals, never retried; `scheduler_busy` is
+retried; any other status or a body that is not exactly the contract shape is
+"unavailable". Bootstrap sends `{protocolVersion, binding, startJournalId}` and
+accepts only `{credential: dlc_..., expiresAt}`.
 
-- G2: the control routes `POST /api/agent-gateway/pool/start`, `/bootstrap` and
-  `/report` on the tools URL's origin (Bearer `agx_`, redirects never followed)
-  do not exist on any server yet. The bootstrap request body is assumed to equal
-  the start request body.
-- G3: the bootstrap response is assumed to be
-  `{"credential": "dlc_...", "expiresAt": "<iso>"}`.
-- G4: report and cancel-ack transport is RPC-only on the server
-  (`agent_gateway_pooled_report`). The plugin POSTs the fixture bodies to the
-  provisional `/api/agent-gateway/pool/report` path; a failed report is logged
-  and not retried (there is no outbox).
-- G5: `capability_proof(challenge)` answers a capability challenge as a pure
-  function (only when pooled mode is fully configured); no network channel for
-  the challenge is specified, so none exists.
+Open gaps that keep this from running against a real server:
+
+- GAP-A: no server path delivers an `agx_` to a cloud executor (the server
+  mints one only in the tray start response, which this plugin never adopts).
+  The configured `ARTIFACTBRIDGE_POOL_EXECUTOR_CREDENTIAL` is scaffolding.
+- GAP-B: the plugin generates its own startJournalId. For a cloud start the
+  server issues a permit only when the request replays the journal id the
+  server chose; otherwise it answers `start_not_authorized`, and the plugin
+  ends the task rejected with no bootstrap and no turn. The self-generated id is
+  scaffolding until the server delivers its journal id.
+- Capability transport: `PoolControl.prove_capability` GETs the challenge,
+  answers it and POSTs the proof; nothing in the plugin calls it on its own.
+  A successful GET is not evidence of eligibility: only the POST is verified,
+  in SQL, and the proof never claims open-pool consent.
+  `capability_proof(challenge)` remains the pure function for a challenge
+  obtained another way.
 
 Contract ambiguities, as implemented:
 
-- `dispatchId` is treated as globally unique within the journal: a second
-  assignment reusing an existing `dispatchId` with a different envelope is
-  refused `tuple_mismatch`.
+- The server mints `dispatchId` as `'agd_'` plus a dashless random UUID
+  (`supabase/migrations/20261017071910_ai4046_oldest-eligible-scheduler.sql:657`),
+  so it is treated as unique within the journal: a second assignment reusing an
+  existing `dispatchId` with a different envelope is refused `tuple_mismatch`
+  without a start request.
 - After a crash between permit and spawn, the row returns to `start_requested`
-  and a retry bootstraps a new `dlc_`.
+  and a retry sends the same startJournalId and bootstraps again; the server
+  revokes the earlier `dlc_`.
+- A `dlc_` lasts 15 minutes and is never refreshed; a longer turn's pooled
+  tools fail with the server's credential error.
 - The pooled listener does not apply the stock adapter's per-context anti-loop
   turn counter.
 - The `send` override that resolves only the task named by `reply_to` is

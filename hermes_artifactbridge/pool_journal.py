@@ -6,6 +6,10 @@ ids. States: journaled -> start_requested -> permitted -> spawned -> finished | 
 No secrets: the agx_ control credential and the dlc_ task credential never reach this file. Rows are
 never deleted (a refused or withdrawn row keeps its context known).
 
+Reports are durable: ``pending_reports`` holds the row's unacknowledged, content-free report bodies in
+sequence order, appended in the same transaction that allocates the sequence and makes the lifecycle
+transition. ``report_refusal`` records a report the server refused for good; it is not an execution state.
+
 Every mutation runs in its own connection under ``BEGIN IMMEDIATE``, so two deliveries of the same
 dispatch (threads or processes) serialize on the database write lock.
 """
@@ -17,6 +21,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
+
+from .pool_protocol import report_body
 
 TERMINAL_STATES = frozenset({"finished", "refused", "uncertain"})
 
@@ -35,12 +41,16 @@ CREATE TABLE IF NOT EXISTS dispatches (
     result_text TEXT,
     refusal TEXT,
     updated_at REAL NOT NULL,
+    pending_reports TEXT,
+    report_refusal TEXT,
     PRIMARY KEY (assignment_id, dispatch_id)
 );
 CREATE INDEX IF NOT EXISTS dispatches_dispatch ON dispatches (dispatch_id);
 CREATE INDEX IF NOT EXISTS dispatches_delegation ON dispatches (delegation_id);
 CREATE INDEX IF NOT EXISTS dispatches_context ON dispatches (context_id);
 """
+# Columns added after 0.2.0.dev0's first schema; an existing journal gains them on open.
+_ADDED_COLUMNS = ("pending_reports", "report_refusal")
 
 
 def _row(raw: sqlite3.Row | None) -> dict | None:
@@ -83,10 +93,30 @@ class Tx:
             f" AND state IN ({marks})", (*fields.values(), time.time(), *key, *from_states))
         return cursor.rowcount == 1
 
-    def next_report_sequence(self, key: tuple[str, str]) -> int:
+    def enqueue_report(self, key: tuple[str, str], kind: str, outcome: str | None) -> None:
+        """Allocate the row's next report sequence and append that report to its pending reports."""
         self._conn.execute("UPDATE dispatches SET report_sequence = report_sequence + 1 WHERE assignment_id = ?"
                            " AND dispatch_id = ?", key)
-        return self.get(key)["report_sequence"]
+        row = self.get(key)
+        body = report_body(row["envelope"]["binding"], row["report_sequence"], kind, outcome)
+        self._set_pending(key, json.loads(row["pending_reports"] or "[]") + [body])
+
+    def with_pending_reports(self) -> list[dict]:
+        return [_row(r) for r in self._conn.execute(
+            "SELECT * FROM dispatches WHERE pending_reports IS NOT NULL ORDER BY updated_at")]
+
+    def ack_report(self, key: tuple[str, str], sequence: int, refusal: str | None = None) -> None:
+        """Drop the acknowledged (or permanently refused) report ``sequence``; record a refusal apart."""
+        row = self.get(key)
+        bodies = json.loads(row["pending_reports"] or "[]")
+        self._set_pending(key, [b for b in bodies if b["reportSequence"] != sequence])
+        if refusal:
+            self._conn.execute("UPDATE dispatches SET report_refusal = ? WHERE assignment_id = ? AND dispatch_id = ?",
+                               (refusal, *key))
+
+    def _set_pending(self, key: tuple[str, str], bodies: list[dict]) -> None:
+        self._conn.execute("UPDATE dispatches SET pending_reports = ? WHERE assignment_id = ? AND dispatch_id = ?",
+                           (json.dumps(bodies, separators=(",", ":")) if bodies else None, *key))
 
 
 class Journal:
@@ -97,6 +127,12 @@ class Journal:
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA)
+            conn.execute("BEGIN IMMEDIATE")  # two processes opening an old journal add each column once
+            existing = {column[1] for column in conn.execute("PRAGMA table_info(dispatches)")}
+            for column in _ADDED_COLUMNS:
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE dispatches ADD COLUMN {column} TEXT")
+            conn.execute("COMMIT")
         finally:
             conn.close()
 
