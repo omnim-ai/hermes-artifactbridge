@@ -24,7 +24,12 @@ def is_trusted_url(value: str) -> bool:
     return url.scheme == "http" and url.hostname in _LOOPBACK_HOSTS
 
 
+def url_on_origin(tools_url: str, path: str) -> str:
+    """Same scheme and host as the configured tools URL, fixed path."""
+    url = urlsplit(tools_url)
+    return urlunsplit((url.scheme, url.netloc, path, "", ""))
+
+
 def renew_url_for(tools_url: str) -> str:
     """Same scheme and host as the configured tools URL, fixed renewal path."""
-    url = urlsplit(tools_url)
-    return urlunsplit((url.scheme, url.netloc, RENEW_PATH, "", ""))
+    return url_on_origin(tools_url, RENEW_PATH)

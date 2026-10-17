@@ -1,5 +1,5 @@
 name: hermes-artifactbridge
-version: 0.1.0.dev0
+version: 0.2.0.dev0
 kind: standalone
 description: >
   ArtifactBridge delegation plugin. During an ArtifactBridge A2A delegation the
@@ -25,6 +25,31 @@ provides_tools:
   - artifactbridge_delegation_propose_change
   - artifactbridge_read_space_context
   - artifactbridge_read_skill
+# Pooled mode only (ARTIFACTBRIDGE_POOL_ENABLED=1 and the executor settings below): the plugin also registers
+# the `artifactbridge-pool` platform and the token-free `artifactbridge_pool_*` variants of the eleven tools
+# (toolset `artifactbridge-pool`). They are not listed above because an unconfigured install never registers them.
+# Pooled control routes follow artifact-forge c0b4de56c, which is not merged or deployed (see README).
+optional_env:
+  - name: ARTIFACTBRIDGE_POOL_ENABLED
+    description: "Set to 1 to opt in to pooled (assignment-bound) execution, protocol v1. Off by default: its server routes are not deployed yet (see README)."
+    prompt: "Enable ArtifactBridge pooled execution (1 or empty)"
+    password: false
+  - name: ARTIFACTBRIDGE_POOL_EXECUTOR_CREDENTIAL
+    description: "Executor control credential (agx_...). Authenticates pooled start/bootstrap/report only; grants no content."
+    prompt: "ArtifactBridge pooled executor credential (agx_...)"
+    password: true
+  - name: ARTIFACTBRIDGE_POOL_EXECUTOR_ID
+    description: "This executor's UUID; pooled assignments for any other executor are refused."
+    prompt: "ArtifactBridge pooled executor id (uuid)"
+    password: false
+  - name: ARTIFACTBRIDGE_POOL_CONNECTION_REVISION
+    description: "This executor's connection revision (decimal string); assignments for another revision are refused."
+    prompt: "ArtifactBridge pooled connection revision"
+    password: false
+  - name: ARTIFACTBRIDGE_POOL_PORT
+    description: "Port for the separate artifactbridge-pool A2A listener (else platform extra.port, else 9901)."
+    prompt: "ArtifactBridge pooled listener port (or empty)"
+    password: false
 # No Hermes hooks: the token rides in the task text and the tools are static.
 provides_hooks: []
 # pyproject.toml beside this manifest is what Hermes installs (it wins over this list); kept in sync.

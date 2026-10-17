@@ -1,0 +1,164 @@
+"""Token-free pooled tools: per-task dlc_ resolution from the Hermes session, isolation between concurrent
+sessions, no fallback, expiry returned as-is; legacy dlt_ tools refuse inside a pooled session."""
+import asyncio
+import json
+import sys
+import types
+from contextvars import ContextVar
+
+import pytest
+
+import hermes_artifactbridge as plugin_module
+from hermes_artifactbridge import register
+from hermes_artifactbridge.pool_core import POOL_PLATFORM, CredentialBindings
+from hermes_artifactbridge.schemas import POOL_TOOL_SCHEMAS, POOL_WIRE_NAMES, TOKEN_ARG, TOOL_SCHEMAS
+from hermes_artifactbridge.tools import PooledTools
+from tests import fake_ab
+from tests.conftest import FakeCtx
+from tests.fake_pool import EXECUTOR_CREDENTIAL, EXECUTOR_ID, REVISION
+
+POOL_READ_BRIEF = "artifactbridge_pool_delegation_read_brief"
+POOL_CONTRIBUTE = "artifactbridge_pool_delegation_contribute"
+POOL_READ_SKILL = "artifactbridge_pool_read_skill"
+SESSION = ContextVar("session", default={})
+DLC_A, DLC_B = "dlc_" + "a" * 43, "dlc_" + "b" * 43
+
+
+@pytest.fixture(autouse=True)
+def session_context(monkeypatch):
+    """Stands in for ``gateway.session_context``: per-asyncio-task session vars, as Hermes binds them."""
+    module = types.ModuleType("gateway.session_context")
+    module.get_session_env = lambda name, default="": SESSION.get().get(name, default)
+    if "gateway" not in sys.modules:
+        monkeypatch.setitem(sys.modules, "gateway", types.ModuleType("gateway"))
+    monkeypatch.setitem(sys.modules, "gateway.session_context", module)
+
+
+def in_session(platform: str, chat_id: str, message_id: str) -> None:
+    SESSION.set({"HERMES_SESSION_PLATFORM": platform, "HERMES_SESSION_CHAT_ID": chat_id,
+                 "HERMES_SESSION_MESSAGE_ID": message_id})
+
+
+@pytest.fixture
+def credentials(ab):
+    ab.delegations["del-2"] = fake_ab.Delegation(id="del-2", room_id="room-2")
+    ab.pooled_credentials.update({DLC_A: {"delegation_id": "del-1"}, DLC_B: {"delegation_id": "del-2"}})
+    bound = CredentialBindings()
+    bound.bind(POOL_PLATFORM, "ctx-a", "task-a", DLC_A, {"delegationId": "del-1"})
+    bound.bind(POOL_PLATFORM, "ctx-b", "task-b", DLC_B, {"delegationId": "del-2"})
+    return bound
+
+
+@pytest.fixture
+def pooled(app, credentials):
+    return PooledTools(tools_url=fake_ab.TOOLS_URL, credentials=credentials, http_factory=fake_ab.http_factory(app))
+
+
+def test_pooled_schemas_mirror_the_legacy_tools_without_the_token():
+    assert len(POOL_TOOL_SCHEMAS) == len(TOOL_SCHEMAS) == 11
+    for pool, legacy in zip(POOL_TOOL_SCHEMAS, TOOL_SCHEMAS):
+        assert POOL_WIRE_NAMES[pool["name"]] == legacy["name"] and pool["name"].startswith("artifactbridge_pool_")
+        assert TOKEN_ARG not in pool["parameters"]["properties"] and TOKEN_ARG not in pool["parameters"]["required"]
+        assert TOKEN_ARG not in pool["description"]
+        assert pool["parameters"]["properties"] == {k: v for k, v in legacy["parameters"]["properties"].items()
+                                                    if k != TOKEN_ARG}
+
+
+async def test_two_concurrent_sessions_each_present_only_their_own_credential(pooled, ab):
+    async def call(context_id, task_id):
+        in_session(POOL_PLATFORM, context_id, task_id)
+        await asyncio.sleep(0)
+        return json.loads(await pooled.handler_for(POOL_READ_BRIEF)({}, task_id="t"))
+
+    a, b = await asyncio.gather(call("ctx-a", "task-a"), call("ctx-b", "task-b"))
+    assert (a["delegation_id"], b["delegation_id"]) == ("del-1", "del-2")
+    assert {r["authorization"] for r in ab.requests} == {f"Bearer {DLC_A}", f"Bearer {DLC_B}"}
+    assert all(r["token"] == "" and r["path"] == fake_ab.TOOLS_PATH for r in ab.requests)
+
+
+@pytest.mark.parametrize("route", [
+    ("", "", ""),                                   # outside any gateway turn
+    ("a2a", "ctx-a", "task-a"),                     # the stock A2A platform
+    (POOL_PLATFORM, "ctx-a", "task-b"),             # another task's id on this context
+    (POOL_PLATFORM, "ctx-b", "task-a"),             # this task's id on another context
+    (POOL_PLATFORM, "ctx-a", ""),                   # no task id
+])
+async def test_without_an_exact_binding_pooled_tools_refuse_without_network(pooled, ab, route):
+    in_session(*route)
+    assert await pooled.invoke(POOL_READ_BRIEF, {}) == {"error": "pooled_credential_unavailable"}
+    assert ab.requests == []
+
+
+async def test_a_dropped_binding_refuses(pooled, ab, credentials):
+    credentials.drop(POOL_PLATFORM, "ctx-a", "task-a")
+    in_session(POOL_PLATFORM, "ctx-a", "task-a")
+    assert await pooled.invoke(POOL_READ_BRIEF, {}) == {"error": "pooled_credential_unavailable"}
+    assert ab.requests == []
+
+
+async def test_expired_pooled_credential_is_returned_as_is_without_renewal(pooled, ab):
+    ab.pooled_credentials[DLC_A]["expired"] = True
+    in_session(POOL_PLATFORM, "ctx-a", "task-a")
+    assert await pooled.invoke(POOL_CONTRIBUTE, {"kind": "message", "body": "x"}) == {"error": "credential_expired",
+                                                                                       "status": 403}
+    assert ab.renew_calls == 0 and len([r for r in ab.requests if r["path"] == fake_ab.TOOLS_PATH]) == 1
+
+
+async def test_reserved_args_and_a_model_supplied_token_are_stripped_like_legacy(pooled, ab):
+    in_session(POOL_PLATFORM, "ctx-a", "task-a")
+    await pooled.invoke(POOL_CONTRIBUTE, {TOKEN_ARG: "dlt_" + "x" * 43, "delegation_id": "del-other",
+                                          "room_id": "room-stolen", "kind": "message", "body": "hi"})
+    await pooled.invoke(POOL_READ_SKILL, {"delegation_id": "del-1", "slug": "brand-voice"})
+    assert ab.tool_calls == [("artifactbridge_delegation_contribute", {"kind": "message", "body": "hi"}),
+                             ("artifactbridge_read_skill", {"delegation_id": "del-1", "slug": "brand-voice"})]
+    assert all(r["token"] == "" for r in ab.requests)
+
+
+async def test_legacy_tools_refuse_inside_a_pooled_session(registered_tools, ab, token):
+    in_session(POOL_PLATFORM, "ctx-a", "task-a")
+    for name, tool in registered_tools.items():
+        result = json.loads(await tool["handler"]({TOKEN_ARG: token}, task_id="t"))
+        assert result == {"error": "pooled_session_requires_pooled_tools"}, name
+    assert ab.requests == []
+    in_session("a2a", "ctx-a", "task-a")  # outside a pooled session legacy tools are unchanged
+    result = json.loads(await registered_tools["artifactbridge_delegation_read_brief"]["handler"]({TOKEN_ARG: token}))
+    assert result["ok"] is True
+
+
+POOL_ENV = {"ARTIFACTBRIDGE_POOL_ENABLED": "1", "ARTIFACTBRIDGE_POOL_EXECUTOR_CREDENTIAL": EXECUTOR_CREDENTIAL,
+            "ARTIFACTBRIDGE_POOL_EXECUTOR_ID": EXECUTOR_ID, "ARTIFACTBRIDGE_POOL_CONNECTION_REVISION": REVISION}
+
+
+def _registered(monkeypatch, env: dict) -> tuple[FakeCtx, list]:
+    for name in POOL_ENV:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("ARTIFACTBRIDGE_SERVICE_CREDENTIAL", fake_ab.SERVICE_CREDENTIAL)
+    ctx, platforms = FakeCtx(), []
+    ctx.register_platform = lambda **kw: platforms.append(kw)
+    register(ctx)
+    return ctx, platforms
+
+
+@pytest.mark.parametrize("env", [
+    {},
+    {**POOL_ENV, "ARTIFACTBRIDGE_POOL_ENABLED": "0"},
+    {**POOL_ENV, "ARTIFACTBRIDGE_POOL_EXECUTOR_CREDENTIAL": "dlt_" + "a" * 43},
+    {**POOL_ENV, "ARTIFACTBRIDGE_POOL_EXECUTOR_ID": "not-a-uuid"},
+    {**POOL_ENV, "ARTIFACTBRIDGE_POOL_CONNECTION_REVISION": "01"},
+    {k: v for k, v in POOL_ENV.items() if k != "ARTIFACTBRIDGE_POOL_EXECUTOR_CREDENTIAL"},
+], ids=["unset", "disabled", "wrong-credential", "bad-executor", "bad-revision", "partial"])
+def test_unconfigured_pooled_mode_registers_exactly_the_legacy_surface(monkeypatch, env):
+    baseline, _ = _registered(monkeypatch, {})
+    ctx, platforms = _registered(monkeypatch, env)
+    assert platforms == []
+    assert [(t["name"], t["toolset"]) for t in ctx.tools] == [(t["name"], t["toolset"]) for t in baseline.tools]
+    assert [t["name"] for t in ctx.tools] == [s["name"] for s in TOOL_SCHEMAS] and ctx.skills == baseline.skills
+
+
+def test_configured_pooled_mode_on_an_untested_hermes_registers_nothing_extra(monkeypatch, caplog):
+    monkeypatch.setattr(plugin_module.pool_adapter, "hermes_shape_supported", lambda: False)
+    ctx, platforms = _registered(monkeypatch, POOL_ENV)
+    assert platforms == [] and [t["name"] for t in ctx.tools] == [s["name"] for s in TOOL_SCHEMAS]
+    assert "outside the tested range" in caplog.text and "agx_" not in caplog.text
