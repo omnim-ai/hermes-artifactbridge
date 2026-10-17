@@ -17,9 +17,8 @@ import logging
 import threading
 import time
 
-from .pool_core import (CANCELED, COMPLETED, FAILED, POOL_PLATFORM, REJECTED, Decision, clarification_text,
-                        refusal_text)
-from .pool_protocol import CAPABILITY_METHOD, METADATA_KEY, Refused, capability_answer, pool_grant
+from .pool_core import CANCELED, COMPLETED, FAILED, POOL_PLATFORM, REJECTED, Decision, clarification, refusal_text
+from .pool_protocol import CAPABILITY_METHOD, METADATA_KEY, TERMINAL_KEY, Refused, capability_answer, pool_grant
 
 logger = logging.getLogger(__name__)
 
@@ -138,12 +137,11 @@ def build_adapter_class():
             self._json(200, getattr(adapter, handler_name)(req_id, params, identity, grant))
 
     class PoolAdapter(A2AAdapter):
-        def __init__(self, config, *, core, tools, port: int):
+        def __init__(self, config, *, core, port: int):
             super().__init__(config)
             self.platform = Platform(POOL_PLATFORM)
             self.port = port
             self._core = core
-            self._tools = tools  # the pooled scoped tools (PooledTools), for a clarification's Room question
             self._events: dict[str, object] = {}  # A2A task id -> its MessageEvent, for a session cancel
             self._admitted: dict[str, threading.Event] = {}  # set once Hermes admitted the task's turn
             self._finalizers: dict[str, threading.Thread] = {}  # waits on the task's reply, records its outcome
@@ -235,7 +233,10 @@ def build_adapter_class():
             view = self._core.projection(row)
             state = {"submitted": protocol.STATE_SUBMITTED, "working": protocol.STATE_WORKING}.get(
                 view.kind) or a2a_state[view.outcome]
-            return self._with_assignment(protocol.build_task(row["task_id"], row["context_id"], state, view.text), row)
+            task = self._with_assignment(protocol.build_task(row["task_id"], row["context_id"], state, view.text), row)
+            if view.terminal:
+                task["metadata"][TERMINAL_KEY] = view.terminal
+            return task
 
         @staticmethod
         def _with_assignment(task: dict, row) -> dict:
@@ -271,7 +272,11 @@ def build_adapter_class():
             rec = self.tasks.create(task_id, decision.context_id or protocol.new_context_id(), peer,
                                     *self._scope_for_agent(None))
             task = self._end_task(rec, a2a_state[decision.outcome], decision.text, stored_reply=decision.text)[0]
-            return self._with_assignment(task, row) if row is not None and row["task_id"] == task_id else task
+            if row is not None and row["task_id"] == task_id:
+                return self._with_assignment(task, row)
+            if decision.terminal:  # a continuation: rejected before any row, control call or turn
+                task["metadata"] = {TERMINAL_KEY: decision.terminal}
+            return task
 
         def _dispatch(self, params, peer, context_id, task_id) -> None:
             """The stock local dispatch (anti-loop, framing, audit, persistence, push) under the permitted ids.
@@ -321,28 +326,28 @@ def build_adapter_class():
             await super().on_processing_start(event)
 
         def _finalize_task(self, pending, state, reply):
+            """The journal first: the row's result, cloudTerminal and report commit in one transaction before
+            the stock finalizer's volatile TaskStore, persistence, audit and push, so Get/List after a crash or
+            a lost response answer from the journal. A clarification cannot be continued (AI-4105): the task
+            fails with ``artifactbridge.cloudTerminal`` and the server, not this runner, posts the question."""
             task_id = pending["task_id"]
-            stripped = security.redact_outbound(reply or "").lstrip()
+            timed_out = not pending["future"].done()  # the stock wait gave up: the turn's stop is unknown
+            reply = security.redact_outbound(reply or "")
+            stripped, terminal = reply.lstrip(), None
             if state == protocol.STATE_COMPLETED and stripped.upper().startswith(protocol.INPUT_REQUIRED_MARKER):
-                # A clarification cannot be continued here (product ruling; AI-4105): its question goes to the
-                # Room under this task's dlc_ (still bound), then the task fails with resend guidance.
-                question = stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
-                if question:
-                    posted = asyncio.run(self._tools.invoke_for(
-                        (POOL_PLATFORM, pending["context_id"], task_id), "artifactbridge_pool_delegation_contribute",
-                        {"kind": "question", "body": question, "idempotency_key": f"clarification-{task_id}"}))
-                    if "error" in posted:
-                        logger.warning("artifactbridge pooled clarification not posted: %s", posted["error"])
-                state, reply = protocol.STATE_FAILED, clarification_text(question)
-            state, reply = super()._finalize_task(pending, state, reply)
-            # Only this task's own row; a replaced row is left untouched and unreported.
-            if state == protocol.STATE_CANCELED and task_id in self._cancel_requested:
-                self._core.cancel(task_id)
-            else:
-                self._core.finish(task_id, core_outcome.get(state, FAILED), reply)
-            self._cancel_requested.discard(task_id)
-            for live in (self._events, self._admitted, self._finalizers):
-                live.pop(task_id, None)
+                state = protocol.STATE_FAILED
+                reply, terminal = clarification(stripped[len(protocol.INPUT_REQUIRED_MARKER):])
+            try:  # only this task's own row; a replaced row is left untouched and unreported
+                if state == protocol.STATE_CANCELED and task_id in self._cancel_requested:
+                    self._core.cancel(task_id)
+                else:
+                    self._core.finish(task_id, core_outcome.get(state, FAILED), reply, terminal=terminal,
+                                      timed_out=timed_out)
+            finally:
+                state, reply = super()._finalize_task(pending, state, reply)
+                self._cancel_requested.discard(task_id)
+                for live in (self._events, self._admitted, self._finalizers):
+                    live.pop(task_id, None)
             return state, reply
 
         async def send(self, chat_id, content, reply_to=None, metadata=None):

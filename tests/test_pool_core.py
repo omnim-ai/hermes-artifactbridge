@@ -289,6 +289,78 @@ def test_turn_outcomes_map_to_report_outcomes(core, server, state, outcome):
     assert server.reports[-1]["kind"] == "stopped" and server.reports[-1]["outcome"] == outcome
 
 
+ASKED = {"reason": "clarification_unsupported", "question": "Which tone?"}
+CONTINUED = {"reason": "continuation_unsupported"}
+
+
+def test_a_cloud_terminal_commits_with_its_failed_result_and_stopped_report_and_the_first_result_wins(
+        core, server, journal_path):
+    server.faults[REPORT_PATH] = ["down", "down"]  # running, then its retry before stopped: both stay pending
+    metadata = server.issue(envelope())
+    admit(core, metadata, CTX, "task-1")
+    core.started("task-1")
+    other = {"reason": "clarification_unsupported", "question": "Which colour?"}
+    callbacks = [("asked", ASKED), ("asked", ASKED), ("other", other)]  # identical retries and a conflicting one
+    barrier = threading.Barrier(len(callbacks))
+
+    def finish(text, terminal):
+        barrier.wait()
+        core.finish("task-1", FAILED, text, terminal=terminal)
+
+    threads = [threading.Thread(target=finish, args=c) for c in callbacks]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    core.finish("task-1", FAILED, "later", terminal=other)  # a late callback after the first terminal
+    row = rows(journal_path)[0]
+    won = json.loads(row["cloud_terminal"])
+    assert (won, row["result_text"]) in ((ASKED, "asked"), (other, "other"))  # one callback's pair, never mixed
+    assert (row["state"], row["result_state"]) == ("finished", FAILED)
+    assert pending(journal_path) == [[(1, "running"), (2, "stopped")]]  # one stopped report, in the same commit
+    assert json.loads(row["pending_reports"])[1] == report_body(envelope()["binding"], 2, "stopped", "failed")
+    decision = admit(core, metadata, CTX, "task-2")  # the lost Send response: the journaled terminal answers
+    assert (decision.outcome, decision.text, decision.terminal) == (FAILED, row["result_text"], won)
+    assert sent(server.reports) == [(1, "running"), (2, "stopped")] and pending(journal_path) == [[]]
+
+
+def test_a_crash_after_the_terminal_commit_answers_it_after_restart_and_replays_the_report(make_core, server,
+                                                                                         journal_path):
+    server.faults[REPORT_PATH] = ["down", "down"]  # the process dies before the stopped report is acknowledged
+    metadata = server.issue(envelope())
+    first = make_core()
+    admit(first, metadata, CTX, "task-1")
+    first.started("task-1")
+    first.finish("task-1", FAILED, "asked", terminal=ASKED)
+    restarted = make_core()
+    restarted.recover()  # a finished row is no lost turn: never uncertain, never a crash report
+    assert rows(journal_path)[0]["state"] == "finished" and server.reports == []
+    row = restarted.recovery_row(grant_for(envelope()))  # the server's authenticated Get restores the agx_
+    view = restarted.projection(row)
+    assert (view.outcome, view.text, view.terminal) == (FAILED, "asked", ASKED)
+    assert server.reports == [report_body(envelope()["binding"], 1, "running", None),
+                              report_body(envelope()["binding"], 2, "stopped", "failed")]
+
+
+def test_a_lost_stopped_ack_is_replayed_in_order_and_never_reported_twice(core, server, journal_path):
+    admit(core, server.issue(envelope()), CTX, "task-1")
+    core.started("task-1")
+    server.faults[REPORT_PATH] = ["lost"]  # the server records the stopped report; its response is lost
+    core.finish("task-1", FAILED, "asked", terminal=ASKED)
+    assert sent(server.reports) == [(1, "running"), (2, "stopped")] and pending(journal_path) == [[(2, "stopped")]]
+    core.deliver_reports()
+    assert sent(server.replays) == [(2, "stopped")] and len(server.reports) == 2 and pending(journal_path) == [[]]
+    assert json.loads(rows(journal_path)[0]["cloud_terminal"]) == ASKED
+
+
+def test_a_turn_the_runtime_never_answered_reports_timed_out_never_a_confirmed_failure(core, server, journal_path):
+    admit(core, server.issue(envelope()), CTX, "task-1")
+    core.started("task-1")
+    core.finish("task-1", FAILED, "[agent did not reply in time]", timed_out=True)
+    assert server.reports[-1] == report_body(envelope()["binding"], 2, "stopped", "timed_out")
+    assert rows(journal_path)[0]["cloud_terminal"] is None
+
+
 def test_the_journal_row_is_committed_before_the_start_request(core, server, journal_path):
     seen = []
     server.on_start = lambda body: seen.append([(r["state"], r["start_journal_id"]) for r in rows(journal_path)])
@@ -436,7 +508,7 @@ def test_restart_marks_a_spawned_turn_uncertain_reports_crashed_and_never_respaw
     # The restarted process holds no agx_: the crash report waits for the server to present the grant.
     assert len(server.reports) == 1 and pending(journal_path) == [[(2, "stopped")]]
     retry = admit(restarted, metadata, CTX, "task-2")
-    assert (retry.kind, retry.outcome) == ("terminal", FAILED) and "uncertain" in retry.text
+    assert (retry.kind, retry.outcome, retry.terminal) == ("terminal", FAILED, None) and "uncertain" in retry.text
     assert server.reports[-1] == report_body(envelope()["binding"], 2, "stopped", "crashed")
     restarted.recover()  # idempotent: no second crash report
     assert len(server.starts) == 1 and len(server.bootstraps) == 1 and len(server.reports) == 2
@@ -471,14 +543,15 @@ def test_a_continuation_after_a_clarification_is_continuation_unsupported_on_any
     core.finish("task-1", FAILED, "clarification_unsupported")
     before = len(server.requests)
     decision = admit(core, server.issue(continuation(42)), context_id, "task-2")
-    assert (decision.kind, decision.outcome) == ("terminal", REJECTED)
-    assert "continuation_unsupported" in decision.text and "send the task again" in decision.text
+    assert (decision.kind, decision.outcome, decision.terminal) == ("terminal", REJECTED, CONTINUED)
+    assert decision.text == ("This cloud task cannot resume. Send the task again as a new request with your answer "
+                             "and the context it needs.")  # PM's exact copy (cloud-clarification-amendment/copy.md)
     assert len(server.requests) == before and len(rows(journal_path)) == 1  # no start, bootstrap or new row
 
 
 def test_a_continuation_for_a_session_unknown_to_the_journal_is_continuation_unsupported(core, server, journal_path):
     decision = admit(core, server.issue(continuation(40)), CTX, "task-1")
-    assert decision.outcome == REJECTED and "continuation_unsupported" in decision.text
+    assert (decision.outcome, decision.terminal) == (REJECTED, CONTINUED)
     assert rows(journal_path) == [] and server.requests == []
 
 
@@ -492,7 +565,7 @@ def test_the_fixture_continuation_with_its_own_grant_is_refused_before_any_contr
     before = len(server.requests)
     decision = core.admit(server.issue(envelope_from_metadata(params["metadata"])), params["message"]["contextId"],
                           "task-2", grant=grant, message_id=params["message"]["messageId"])
-    assert decision.outcome == REJECTED and "continuation_unsupported" in decision.text
+    assert (decision.outcome, decision.terminal) == (REJECTED, CONTINUED)
     assert len(server.requests) == before and len(rows(journal_path)) == 1
 
 
@@ -503,7 +576,7 @@ def test_a_continuation_after_any_first_outcome_is_continuation_unsupported(core
         core.finish("task-1", first_outcome, "")
     before = len(server.requests)
     decision = admit(core, server.issue(continuation(42)), CTX, "task-2")
-    assert decision.outcome == REJECTED and "continuation_unsupported" in decision.text
+    assert (decision.outcome, decision.terminal) == (REJECTED, CONTINUED)
     assert len(server.requests) == before
 
 
@@ -550,7 +623,7 @@ def test_cancel_acknowledges_with_its_own_binding_and_a_late_result_touches_noth
     assert server.reports == reports
     # A continuation of a canceled turn never resumes the session.
     resumed = admit(core, server.issue(continuation(42)), CTX, "task-2")
-    assert resumed.outcome == REJECTED and "continuation_unsupported" in resumed.text
+    assert (resumed.outcome, resumed.terminal) == (REJECTED, CONTINUED)
     states = {r["assignment_id"]: (r["state"], r["result_state"]) for r in rows(journal_path)}
     assert states == {envelope()["binding"]["assignmentId"]: ("finished", "canceled")}
     assert core.cancel("task-1") is False
@@ -562,7 +635,7 @@ def test_refused_rows_are_kept_so_the_context_stays_known(core, server, journal_
     server.refuse_start = None
     assert len(rows(journal_path)) == 1
     decision = admit(core, server.issue(continuation(42)), "ctx-elsewhere", "task-2")
-    assert "continuation_unsupported" in decision.text and len(rows(journal_path)) == 1
+    assert decision.terminal == CONTINUED and len(rows(journal_path)) == 1
 
 
 # ---- secrets ----
@@ -778,7 +851,7 @@ def test_an_existing_journal_gains_the_report_columns_and_keeps_its_rows(make_co
     metadata = server.issue(envelope())
     assert admit(make_core(), metadata, CTX, "task-1").kind == "spawn"
     with sqlite3.connect(journal_path) as conn:  # the first 0.2.0.dev0 schema had none of these columns
-        for column in ("pending_reports", "report_refusal", "grant_fingerprint", "message_id"):
+        for column in ("pending_reports", "report_refusal", "grant_fingerprint", "message_id", "cloud_terminal"):
             conn.execute(f"ALTER TABLE dispatches DROP COLUMN {column}")
     make_core()  # opening twice must not re-add a column
     restarted = make_core()

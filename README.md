@@ -284,17 +284,28 @@ server's requests (see Start headers).
   a refresh never starts a turn). Legacy tools refuse with
   `pooled_session_requires_pooled_tools` inside a pooled session.
 - **Clarification.** A pooled runner cannot continue a conversation. When a
-  turn's reply starts with `[INPUT_REQUIRED]`, the plugin posts the question
-  to the Room as a `question` event through the pooled contribute tool, under
-  the task's own `dlc_`, before anything terminal is recorded. The task then
-  ends `TASK_STATE_FAILED` with `clarification_unsupported`, telling the
-  sender to send the task again as a new request with the answer included, and
-  quoting the question. It is reported `stopped`/`failed`, never an input wait;
-  Get and a repeated Send answer the same failure.
+  turn's reply starts with `[INPUT_REQUIRED]`, the task ends
+  `TASK_STATE_FAILED` with task metadata
+  `artifactbridge.cloudTerminal = {"reason": "clarification_unsupported",
+  "question": <the trimmed question, or null when empty>}` next to
+  `artifactbridge.assignment`. The plugin posts nothing to the Room itself: the
+  server reads the typed terminal from the authenticated task and posts the
+  question with the failure (that server ingestion is not released yet). The
+  status text says the question's delivery is unconfirmed, quotes the question
+  and asks the sender to send the task again as a new request with the answer.
+  A question over 20,000 Unicode code points is never cut short: the task
+  fails with the generic `outcome_too_long` and no cloudTerminal. The result
+  and its cloudTerminal are journaled with the `stopped`/`failed` report in one
+  transaction, before the in-memory task store; the first result wins, and
+  Get, List and a repeated Send answer it, also after a restart. A turn whose
+  reply never arrived (Hermes' `A2A_REPLY_TIMEOUT`) is reported
+  `stopped`/`timed_out`, never a confirmed failure.
 - **Sessions.** Continuations are not supported (native support is tracked as
   AI-4105). Every continuation (a higher execution generation, or another
   assignment of a delegation already journaled) is rejected
-  `continuation_unsupported`, with the same resend guidance, before any control
+  `continuation_unsupported` (task metadata `artifactbridge.cloudTerminal =
+  {"reason": "continuation_unsupported"}`, telling the sender the task cannot
+  resume and to send it again as a new request) before any control
   call: no start, no bootstrap, no turn, no Hermes session and no journal row.
   A context bound to another delegation is refused
   `context_bound_to_other_delegation`.
@@ -302,9 +313,9 @@ server's requests (see Start headers).
   journal at `<HERMES_HOME>/artifactbridge/pool-journal.sqlite3`: one row per
   (assignmentId, dispatchId) with the envelope, the server's startJournalId,
   the `agx_` fingerprint, state, A2A ids (contextId, task id and the Send's
-  messageId), report sequence and the recorded result. It never holds
-  an `agx_` or `dlc_` value. Rows are never deleted;
-  there is no cleanup sweep.
+  messageId), report sequence and the recorded result with its cloudTerminal.
+  It never holds an `agx_` or `dlc_` value. Rows are never deleted; there is no
+  cleanup sweep.
 - **Retries and restart.** A repeated delivery of a dispatch reads its row: a
   running turn is not started twice, a finished or refused dispatch gets its
   recorded answer, and an unanswered start is resent with the same

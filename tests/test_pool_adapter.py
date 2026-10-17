@@ -22,7 +22,6 @@ from hermes_artifactbridge import pool_adapter, register  # noqa: E402
 from hermes_artifactbridge.pool_core import POOL_PLATFORM, CredentialBindings, PoolControl, PoolCore  # noqa: E402
 from hermes_artifactbridge.pool_journal import Journal  # noqa: E402
 from hermes_artifactbridge.pool_protocol import report_body  # noqa: E402
-from hermes_artifactbridge.tools import PooledTools  # noqa: E402
 from tests import fake_ab, fake_pool  # noqa: E402
 from tests.conftest import FakeCtx  # noqa: E402
 from tests.fake_pool import EXECUTOR_ID, REVISION, Clock, FakeControl, envelope, fixture, grant_for  # noqa: E402
@@ -114,24 +113,14 @@ class Listener:
                              control=PoolControl(tools_url=fake_pool.TOOLS_URL, http_factory=server.factory),
                              executor_id=EXECUTOR_ID, connection_revision=REVISION, credentials=self.credentials,
                              now=server.clock)
-        self.ab, self.server = fake_ab.FakeAB(), server  # the scoped tools route
-        server.on_bootstrap = self._bootstrapped
-        tools = PooledTools(tools_url=fake_ab.TOOLS_URL, credentials=self.credentials,
-                            http_factory=fake_ab.http_factory(fake_ab.make_app(self.ab)))
         self.adapter = pool_adapter.build_adapter_class()(PlatformConfig(enabled=True, extra={}), core=self.core,
-                                                          tools=tools, port=0)
+                                                          port=0)
         self.model = Model(self.credentials)
         self.adapter.set_message_handler(self.model)
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
         self.thread.start()
         self.connected = self.run(self.adapter.connect()) if connect else None
-
-    def _bootstrapped(self, body):
-        """The server minted a dlc_: the scoped tools accept it for the assignment's delegation."""
-        delegation = body["binding"]["delegationId"]
-        self.ab.delegations.setdefault(delegation, fake_ab.Delegation(id=delegation))
-        self.ab.pooled_credentials[self.server.live[body["binding"]["assignmentId"]]] = {"delegation_id": delegation}
 
     def run(self, coroutine, timeout=TURN_BOUND):
         return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result(timeout)
@@ -457,7 +446,10 @@ def test_concurrent_duplicate_sends_run_one_turn_and_answer_one_task(listener, s
     assert len({task_of(a)["id"] for _, a in answers}) == 1 and len(answers) == 4
 
 
-def test_no_secret_reaches_the_model_tasks_journal_logs_or_answers(listener, server, journal_path, tmp_path, caplog):
+@pytest.mark.parametrize("reply", ["done", "[INPUT_REQUIRED] Which tone?"], ids=["completed", "clarification"])
+def test_no_secret_reaches_the_model_tasks_journal_logs_or_answers(listener, server, journal_path, tmp_path, caplog,
+                                                                   reply):
+    listener.model.behavior[0] = reply
     server.issue(envelope())
     _, sent = listener.call("cloud-send-request.json")
     task_id = task_of(sent)["id"]
@@ -470,64 +462,131 @@ def test_no_secret_reaches_the_model_tasks_journal_logs_or_answers(listener, ser
     assert [s for s in SECRETS if s in blob] == []
 
 
-# ---- continuation ----
+# ---- clarification and continuation ----
 
-def _clarified(listener, server, monkeypatch) -> tuple[str, list]:
-    """The six-capability handshake, then the fixture Send whose turn asks a clarification. Returns the task id
-    and, per scoped tool call, what the server and a Get saw at that moment."""
+# PM's exact sender copy (cloud-clarification-amendment/copy.md): the runner cannot confirm a Room post.
+UNCONFIRMED = ("The task ended, but we couldn't confirm that its question was posted in the Room. The question is "
+               "included below. Send the task again as a new request with your answer and the context it needs.")
+UNAVAILABLE = ("The task ended, but we couldn't confirm that its question was posted in the Room. The question is "
+               "unavailable. Send the task again as a new request with the context it needs.")
+CANNOT_RESUME = ("This cloud task cannot resume. Send the task again as a new request with your answer and the "
+                 "context it needs.")
+CLOUD_TERMINAL = "artifactbridge.cloudTerminal"
+ASKED = {"reason": "clarification_unsupported", "question": "Which tone?"}
+WIDE = "\U0001F600" * 19_999 + "é"  # 20,000 code points: 40,000 UTF-16 units, yet within the code-point limit
+BINDING = envelope()["binding"]
+
+
+def _asked(listener, server, reply) -> str:
+    """The six-capability handshake, then the fixture Send whose one turn replies ``reply``; returns its task id
+    once its finalizer recorded the outcome."""
     body = copy.deepcopy(fixture("cloud-capability-request.json")["body"])
     body["params"]["requiredCapabilities"].remove("same_session_continuation")
     assert "result" in listener.call("cloud-capability-request.json", body=body)[1]
-    listener.model.behavior[0] = "[INPUT_REQUIRED] Which tone?"
-    seen, call = [], listener.ab._call
-
-    def observed(delegation, name, args):
-        asked = listener.model.turns[0].message_id  # the finalizer can run before the Send answer is read
-        get = listener.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", asked))[1]
-        seen.append(([(r["kind"], r["outcome"]) for r in server.reports], get["result"]["status"]["state"]))
-        return call(delegation, name, args)
-
-    monkeypatch.setattr(listener.ab, "_call", observed)
+    listener.model.behavior[0] = reply
     server.issue(envelope())
     _, sent = listener.call("cloud-send-request.json")
     task_id = task_of(sent)["id"]
     settle(listener, task_id)
-    return task_id, seen
+    return task_id
 
 
-def test_a_clarification_posts_its_question_to_the_room_then_the_task_fails_with_resend_guidance(
-        listener, server, journal_path, monkeypatch):
-    task_id, seen = _clarified(listener, server, monkeypatch)
-    delegation = envelope()["binding"]["delegationId"]
-    assert [(e["delegation_id"], e["kind"], e["body"]) for e in listener.ab.events] == [
-        (delegation, "question", "Which tone?")]
-    assert seen == [([("running", None)], protocol.STATE_WORKING)]  # posted before any terminal outcome
-    assert server.reports[-1] == report_body(envelope()["binding"], 2, "stopped", "failed")
-    for _ in range(2):  # Get and a retried Send both answer the same terminal failure, with no second turn
-        _, got = listener.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task_id))
-        _, again = listener.call("cloud-send-request.json")
-        for task in (got["result"], task_of(again)):
-            text = json.dumps(task["status"])
+def _text(task) -> str:
+    return "".join(part["text"] for part in task["status"]["message"]["parts"])
+
+
+@pytest.mark.parametrize("reply, terminal, text", [
+    ("[INPUT_REQUIRED] Which tone?", ASKED, f"{UNCONFIRMED}\n\nWhich tone?"),
+    ("[input_required] \n ", {"reason": "clarification_unsupported", "question": None}, UNAVAILABLE),
+    (f"[INPUT_REQUIRED]\n {WIDE} \n", {"reason": "clarification_unsupported", "question": WIDE},
+     f"{UNCONFIRMED}\n\n{WIDE}"),
+    (f"[INPUT_REQUIRED] {WIDE}x", None, "outcome_too_long"),  # 20,001: the generic failure, never cut short
+], ids=["question", "empty-is-null", "20000-code-points", "20001-is-outcome-too-long"])
+def test_a_clarification_fails_with_its_journaled_cloud_terminal_on_get_list_and_a_resent_send(
+        listener, server, journal_path, monkeypatch, reply, terminal, text):
+    seen, report = [], server._report
+
+    def observed(body):  # the stopped report goes out after the journal commit, before the volatile TaskStore
+        if body["kind"] == "stopped":
+            row = journaled(journal_path)[0]
+            seen.append((listener.adapter.tasks.get(row["task_id"])["state"], row["state"], row["cloud_terminal"]))
+        return report(body)
+
+    monkeypatch.setattr(server, "_report", observed)
+    task_id = _asked(listener, server, reply)
+    expected = fixture("cloud-send-response.json")["result"]["task"]["metadata"] | (
+        {CLOUD_TERMINAL: terminal} if terminal else {})
+    _, got = listener.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task_id))
+    _, listed = listener.call("cloud-list-tasks-request.json")
+    _, again = listener.call("cloud-send-request.json")  # the server lost the Send response: no second turn
+    assert len(listed["result"]["tasks"]) == 1
+    for task in (got["result"], listed["result"]["tasks"][0], task_of(again)):
+        assert (task["id"], task["status"]["state"], task["metadata"]) == (task_id, protocol.STATE_FAILED, expected)
+        assert _text(task) == text
+    row, = journaled(journal_path)
+    assert (row["state"], row["result_state"], row["result_text"]) == ("finished", "failed", text)
+    assert seen == [(protocol.STATE_WORKING, "finished", row["cloud_terminal"])]
+    assert (json.loads(row["cloud_terminal"]) if row["cloud_terminal"] else None) == terminal
+    # Content-free reports only, and no Room post by the runner: the server ingests the question with the failure.
+    assert server.reports == [report_body(BINDING, 1, "running", None), report_body(BINDING, 2, "stopped", "failed")]
+    assert {r["path"] for r in server.requests} == {fake_pool.START_PATH, fake_pool.BOOTSTRAP_PATH, fake_pool.REPORT_PATH}
+    assert len(listener.model.turns) == 1 and listener.credentials.lookup(POOL_PLATFORM, CONTEXT, task_id) is None
+
+
+def test_a_clarification_journaled_before_a_crash_answers_get_and_list_after_restart_by_grant(
+        listeners, server, journal_path):
+    first = listeners()
+    server.faults[fake_pool.REPORT_PATH] = ["down"] * 20  # no report is acknowledged before the crash
+    task_id = _asked(first, server, "[INPUT_REQUIRED] Which tone?")
+    first.crash()
+    server.faults[fake_pool.REPORT_PATH].clear()
+    try:
+        second = listeners()
+        assert [r["state"] for r in journaled(journal_path)] == ["finished"] and server.reports == []
+        other_agx, other_journal = grant_for(envelope(binding={"assignmentId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000042"}))
+        foreign = {**SEND["headers"], "x-ab-control-credential": other_agx, "x-ab-start-journal-id": other_journal}
+        _, unknown = second.call("cloud-get-task-request.json", headers=foreign,
+                                 body=with_id("cloud-get-task-request.json", task_id))
+        assert unknown["error"]["code"] == protocol.ERR_TASK_NOT_FOUND and server.reports == []
+        _, got = second.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task_id))
+        _, listed = second.call("cloud-list-tasks-request.json")
+        for task in (got["result"], *listed["result"]["tasks"]):
             assert (task["id"], task["status"]["state"]) == (task_id, protocol.STATE_FAILED)
-            assert "clarification_unsupported" in text and "send the task again" in text and "Which tone?" in text
-    assert len(listener.model.turns) == 1 and len(server.starts) == 1 and len(server.reports) == 2
-    assert [(r["state"], r["result_state"]) for r in journaled(journal_path)] == [("finished", "failed")]
-    assert listener.credentials.lookup(POOL_PLATFORM, CONTEXT, task_id) is None
+            assert task["metadata"][CLOUD_TERMINAL] == ASKED
+            assert _text(task) == f"{UNCONFIRMED}\n\nWhich tone?"
+        # The authenticated Get restored the agx_: both journaled reports go out in order, once each.
+        assert server.reports == [report_body(BINDING, 1, "running", None),
+                                  report_body(BINDING, 2, "stopped", "failed")]
+        assert second.model.turns == [] and len(server.starts) == 1 and len(server.bootstraps) == 1
+    finally:
+        first.stop()
 
 
-def test_the_fixture_continuation_after_a_clarification_fails_with_no_turn_session_or_control_call(
-        listener, server, journal_path, monkeypatch):
-    _clarified(listener, server, monkeypatch)
+def test_a_turn_the_runtime_never_answered_reports_timed_out_never_a_confirmed_stop(listener, server,
+                                                                                    monkeypatch):
+    monkeypatch.setenv("A2A_REPLY_TIMEOUT", "1")  # the stock reply wait's floor
+    listener.model.behavior[0] = "block"
+    server.issue(envelope())
+    _, sent = listener.call("cloud-send-request.json")
+    task_id = task_of(sent)["id"]
+    settle(listener, task_id)
+    _, got = listener.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task_id))
+    assert got["result"]["status"]["state"] == protocol.STATE_FAILED
+    assert CLOUD_TERMINAL not in got["result"]["metadata"]
+    assert server.reports[-1] == report_body(BINDING, 2, "stopped", "timed_out")
+
+
+def test_the_fixture_continuation_after_a_clarification_is_rejected_with_no_turn_session_or_control_call(
+        listener, server, journal_path):
+    _asked(listener, server, "[INPUT_REQUIRED] Which tone?")
     server.issue(fixture("cloud-continuation-envelope.json"))
     before = len(server.requests)
     for _ in range(2):
         _, answer = listener.call("cloud-continuation-request.json")
         task = task_of(answer)
-        text = json.dumps(task["status"])
-        assert task["status"]["state"] == protocol.STATE_REJECTED
-        assert "continuation_unsupported" in text and "send the task again" in text
+        assert task["status"]["state"] == protocol.STATE_REJECTED and _text(task) == CANNOT_RESUME
+        assert task["metadata"] == {CLOUD_TERMINAL: {"reason": "continuation_unsupported"}}
     assert len(listener.model.turns) == 1 and server.requests[before:] == []  # no start, bootstrap or report
-    assert len(listener.ab.events) == 1  # only the clarification's question
     assert journaled(journal_path, fixture("cloud-continuation-request.json")["headers"]["x-ab-start-journal-id"]) == []
 
 

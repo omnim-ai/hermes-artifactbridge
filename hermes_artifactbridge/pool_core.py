@@ -39,10 +39,18 @@ POOL_PLATFORM = "artifactbridge-pool"
 # Core outcome names; the adapter maps them to A2A task states.
 COMPLETED, FAILED, CANCELED, REJECTED = "completed", "failed", "canceled", "rejected"
 _REPORT_OUTCOME = {COMPLETED: "completed", FAILED: "failed", CANCELED: "canceled"}
-# Product ruling (2026-10-17): a pooled runner takes initial tasks only, never a continuation (native
-# continuation support is AI-4105). The sender is told to send the task again with the answer.
-_RESEND = ("This runner cannot continue a conversation: send the task again as a new request, with the answer "
-           "included.")
+# A pooled runner takes initial tasks only (AI-4047; native continuation is AI-4105). A clarification or a
+# continuation ends the task with typed ``artifactbridge.cloudTerminal`` task metadata; the server ingests
+# the question and the failure together. Sender copy is PM's (cloud-clarification-amendment/copy.md): the
+# plugin cannot confirm a Room post, so a clarification uses the unconfirmed-delivery wording.
+CLARIFICATION, CONTINUATION = "clarification_unsupported", "continuation_unsupported"
+QUESTION_MAX = 20_000  # ROOM_OUTPUT_MAX_CHARS, in Unicode code points (Python len, SQL char_length)
+_CONTINUATION_TEXT = ("This cloud task cannot resume. Send the task again as a new request with your answer and "
+                      "the context it needs.")
+_UNCONFIRMED = "The task ended, but we couldn't confirm that its question was posted in the Room."
+_QUESTION_BELOW = (" The question is included below. Send the task again as a new request with your answer and "
+                   "the context it needs.")
+_QUESTION_UNAVAILABLE = " The question is unavailable. Send the task again as a new request with the context it needs."
 _UNCERTAIN_TEXT = "ArtifactBridge pooled dispatch outcome uncertain: the executor restarted while it ran."
 
 ControlFactory = Callable[[dict[str, str]], httpx2.Client]
@@ -54,14 +62,22 @@ _REPORTS_PER_PASS = 8
 
 
 def refusal_text(code: str) -> str:
-    text = f"ArtifactBridge pooled dispatch refused: {code}"
-    return f"{text}. {_RESEND}" if code == "continuation_unsupported" else text
+    return _CONTINUATION_TEXT if code == CONTINUATION else f"ArtifactBridge pooled dispatch refused: {code}"
 
 
-def clarification_text(question: str) -> str:
-    """The FAILED result of a turn that asked for clarification; its question went to the Room first."""
-    asked = f" The runner asked: {question}" if question else ""
-    return f"ArtifactBridge pooled task failed: clarification_unsupported. {_RESEND}{asked}"
+def clarification(raw: str) -> tuple[str, dict | None]:
+    """The failed result text and cloudTerminal of a turn whose reply asked a clarification (``raw`` follows
+    the marker). An empty question is ``null``; an over-limit one is the generic ``outcome_too_long`` failure
+    with no cloudTerminal, never cut short."""
+    question = raw.strip() or None
+    if question is not None and len(question) > QUESTION_MAX:
+        logger.warning("artifactbridge pooled clarification of %d code points exceeds %d: outcome_too_long",
+                       len(question), QUESTION_MAX)
+        return "outcome_too_long", None
+    terminal = {"reason": CLARIFICATION, "question": question}
+    if question is None:
+        return _UNCONFIRMED + _QUESTION_UNAVAILABLE, terminal
+    return f"{_UNCONFIRMED}{_QUESTION_BELOW}\n\n{question}", terminal
 
 
 def default_control_factory(headers: dict[str, str]) -> httpx2.Client:
@@ -220,12 +236,14 @@ CREDENTIALS = CredentialBindings()
 class Decision:
     """``spawn``: run the turn as ``task_id`` on ``context_id``. ``working``/``submitted``: the dispatch
     already runs (or is about to) as ``task_id``. ``terminal``: answer ``outcome``/``text`` and run nothing;
-    ``task_id`` is the journaled turn's id, "" when no turn was ever permitted."""
+    ``task_id`` is the journaled turn's id, "" when no turn was ever permitted. ``terminal`` is the task's
+    ``artifactbridge.cloudTerminal`` metadata, if any."""
     kind: str
     context_id: str
     task_id: str = ""
     outcome: str = ""
     text: str = ""
+    terminal: dict | None = None
 
 
 def _key(envelope: dict) -> tuple[str, str]:
@@ -272,7 +290,8 @@ class PoolCore:
             self._hold(grant)
         except Refused as refused:
             logger.info("artifactbridge pooled dispatch refused: %s", refused.code)
-            return Decision("terminal", context_id, outcome=REJECTED, text=refusal_text(refused.code))
+            return Decision("terminal", context_id, outcome=REJECTED, text=refusal_text(refused.code),
+                            terminal={"reason": CONTINUATION} if refused.code == CONTINUATION else None)
         decision = self._advance(row)
         try:  # earlier reports only after this dispatch's own start path (startBy-safe); never alters its decision
             self.deliver_reports()
@@ -323,7 +342,7 @@ class PoolCore:
         # Initial tasks only: every continuation (a later generation, or a delegation already journaled) is
         # refused before any control call, never resumed or started in a replacement session.
         if generation > 1 or tx.where("delegation_id", delegation_id):
-            raise Refused("continuation_unsupported")
+            raise Refused(CONTINUATION)
         return tx.insert(envelope, grant[1], context_id or "ctx-" + uuid.uuid4().hex[:16], _fingerprint(grant[0]),
                          task_id, envelope["dispatchId"])  # admit checked message.messageId == dispatchId
 
@@ -394,7 +413,8 @@ class PoolCore:
     def _terminal(row: dict) -> Decision:
         task_id = row["task_id"] or ""
         if row["state"] == "finished":
-            return Decision("terminal", row["context_id"], task_id, row["result_state"], row["result_text"] or "")
+            return Decision("terminal", row["context_id"], task_id, row["result_state"], row["result_text"] or "",
+                            json.loads(row["cloud_terminal"]) if row["cloud_terminal"] else None)
         if row["state"] == "refused":
             return Decision("terminal", row["context_id"], task_id, REJECTED, refusal_text(row["refusal"]))
         return Decision("terminal", row["context_id"], task_id, FAILED, _UNCERTAIN_TEXT)
@@ -422,17 +442,22 @@ class PoolCore:
             self.deliver_reports()
         return running
 
-    def finish(self, task_id: str, outcome: str, text: str) -> None:
-        """Record a turn's result on its OWN row only; a row already canceled (or replaced) stays as it is
-        and gets no further report."""
-        self._end(task_id, outcome, text, kind="stopped")
+    def finish(self, task_id: str, outcome: str, text: str, *, terminal: dict | None = None,
+               timed_out: bool = False) -> None:
+        """Record a turn's result (and its cloudTerminal) on its OWN row only, in the transaction that queues
+        its stopped report; the first result wins, and a row already ended (canceled, replaced) stays as it
+        is and gets no further report. ``timed_out``: the runtime never answered, so its stop is unknown and
+        the report says ``timed_out``, never ``failed``."""
+        self._end(task_id, outcome, text, kind="stopped", terminal=terminal,
+                  report_outcome="timed_out" if timed_out else None)
 
     def cancel(self, task_id: str) -> bool:
         """A confirmed stop of a live pooled turn: cancel_acknowledged with its own binding; drops its
         credential. Called only once the runtime confirmed the cancellation."""
         return self._end(task_id, CANCELED, "", kind="cancel_acknowledged")
 
-    def _end(self, task_id: str, outcome: str, text: str, *, kind: str, refusal: str | None = None) -> bool:
+    def _end(self, task_id: str, outcome: str, text: str, *, kind: str, refusal: str | None = None,
+             terminal: dict | None = None, report_outcome: str | None = None) -> bool:
         """``refusal`` ends a permitted, never-spawned row as refused; it still reports, as it held a permit."""
         with self._lock:
             key = self._live.get(task_id)
@@ -443,9 +468,10 @@ class PoolCore:
                 ended = tx.update(key, from_states=("permitted",), state="refused", refusal=refusal)
             else:
                 ended = tx.update(key, from_states=("permitted", "spawned", "running"), state="finished",
-                                  result_state=outcome, result_text=text)
+                                  result_state=outcome, result_text=text,
+                                  cloud_terminal=json.dumps(terminal, ensure_ascii=False) if terminal else None)
             if ended:
-                tx.enqueue_report(key, kind, _REPORT_OUTCOME[outcome])
+                tx.enqueue_report(key, kind, report_outcome or _REPORT_OUTCOME[outcome])
             row = tx.get(key)
         self.credentials.drop(POOL_PLATFORM, row["context_id"], task_id)
         with self._lock:

@@ -13,6 +13,7 @@ from typing import Callable
 
 PROTOCOL_VERSION = 1
 METADATA_KEY = "artifactbridge.assignment"
+TERMINAL_KEY = "artifactbridge.cloudTerminal"  # task metadata only, never read from a request
 
 # The control routes of artifact-forge src/routes/agent-gateway-pool.ts (a26eb977c; not yet merged or
 # deployed): same origin as the configured tools URL, Bearer <the assignment's agx_ from the start headers>.

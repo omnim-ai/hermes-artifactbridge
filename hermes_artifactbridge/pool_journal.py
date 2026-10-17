@@ -11,6 +11,8 @@ known).
 Reports are durable: ``pending_reports`` holds the row's unacknowledged, content-free report bodies in
 sequence order, appended in the same transaction that allocates the sequence and makes the lifecycle
 transition. ``report_refusal`` records a report the server refused for good; it is not an execution state.
+``cloud_terminal`` is a finished row's ``artifactbridge.cloudTerminal`` task metadata (JSON), written in the
+transaction that records its result.
 
 Every mutation runs in its own connection under ``BEGIN IMMEDIATE``, so two deliveries of the same
 dispatch (threads or processes) serialize on the database write lock.
@@ -47,6 +49,7 @@ CREATE TABLE IF NOT EXISTS dispatches (
     report_refusal TEXT,
     grant_fingerprint TEXT,
     message_id TEXT,
+    cloud_terminal TEXT,
     PRIMARY KEY (assignment_id, dispatch_id)
 );
 CREATE INDEX IF NOT EXISTS dispatches_dispatch ON dispatches (dispatch_id);
@@ -55,7 +58,7 @@ CREATE INDEX IF NOT EXISTS dispatches_context ON dispatches (context_id);
 CREATE INDEX IF NOT EXISTS dispatches_journal ON dispatches (start_journal_id);
 """
 # Columns added after 0.2.0.dev0's first schema; an existing journal gains them on open.
-_ADDED_COLUMNS = ("pending_reports", "report_refusal", "grant_fingerprint", "message_id")
+_ADDED_COLUMNS = ("pending_reports", "report_refusal", "grant_fingerprint", "message_id", "cloud_terminal")
 
 
 def _row(raw: sqlite3.Row | None) -> dict | None:

@@ -114,8 +114,7 @@ def _pool_adapter_factory(config):
     core = PoolCore(journal=Journal(_journal_path()),
                     control=PoolControl(tools_url=_tools_url()),
                     executor_id=_pool_setting(POOL_EXECUTOR_ID_ENV), connection_revision=_pool_setting(POOL_REVISION_ENV))
-    tools = PooledTools(tools_url=_tools_url(), credentials=core.credentials)
-    return pool_adapter.build_adapter_class()(config, core=core, tools=tools, port=_pool_port(config))
+    return pool_adapter.build_adapter_class()(config, core=core, port=_pool_port(config))
 
 
 def _register_pool(ctx) -> None:
