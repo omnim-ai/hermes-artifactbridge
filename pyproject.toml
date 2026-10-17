@@ -1,6 +1,6 @@
 [project]
 name = "hermes-artifactbridge"
-version = "0.1.0.dev0"
+version = "0.2.0.dev0"
 description = "ArtifactBridge delegation plugin for Hermes Agent: scoped AB tools during A2A delegations, no personal AB login."
 readme = "README.md"
 license = "MIT"
