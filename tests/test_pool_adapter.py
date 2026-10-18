@@ -252,6 +252,38 @@ def test_this_hermes_is_the_tested_shape_and_an_untested_version_is_refused(monk
     assert pool_adapter.hermes_shape_supported() is False
 
 
+def test_a_changed_stock_send_final_ledgered_refuses_pooled_registration(pool_env, monkeypatch, caplog):
+    from plugins.platforms.a2a.adapter import A2AAdapter
+
+    async def changed(self, event, session_key, text_content, metadata, *, reply_to):
+        raise AssertionError("never called")
+
+    monkeypatch.setattr(A2AAdapter, "send_final_ledgered", changed)
+    assert pool_adapter.hermes_shape_supported() is False
+    ctx, entries = FakeCtx(), []
+    ctx.register_platform = lambda **entry: entries.append(entry)
+    register(ctx)
+    assert entries == [] and [t for t in ctx.tools if t["toolset"] == "artifactbridge-pool"] == []
+    assert "outside the tested range" in caplog.text
+
+
+def test_the_final_reply_reaches_the_stock_ledger_redacted_with_its_keywords_unchanged(listeners, monkeypatch):
+    from gateway.platforms.base import BasePlatformAdapter
+    seen = []
+
+    async def stock(self, event, session_key, text_content, metadata, *, reply_to, is_ephemeral_response=False):
+        seen.append((event, session_key, text_content, metadata, reply_to, is_ephemeral_response))
+        return "sent", self
+
+    monkeypatch.setattr(BasePlatformAdapter, "send_final_ledgered", stock)
+    listener = listeners(connect=False)
+    event, metadata, dlc = object(), {"notify": True}, "dlc_" + "B" * 43
+    result = listener.run(listener.adapter.send_final_ledgered(event, "session", f"Keys: {AGX} and {dlc}.", metadata,
+                                                               reply_to="task-1", is_ephemeral_response=True))
+    assert result == ("sent", listener.adapter)
+    assert seen == [(event, "session", "Keys: [redacted] and [redacted].", metadata, "task-1", True)]
+
+
 def test_configured_registration_adds_a_separate_listener_and_pooled_tools(registered):
     ctx, entries = registered
     assert [(e.name, e.platform_hint, e.allow_update_command) for e in entries] == [(POOL_PLATFORM, _PLATFORM_HINT, False)]

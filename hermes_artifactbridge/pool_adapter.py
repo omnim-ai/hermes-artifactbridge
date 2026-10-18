@@ -42,6 +42,8 @@ _STOCK_SHAPE = {
     "on_processing_start": ["self", "event"], "_event_session_key": ["self", "event"],
     "cancel_session_processing": ["self", "session_key", "release_guard", "discard_pending"],
     "_set_fatal_error": ["self", "code", "message", "retryable"],
+    "send_final_ledgered": ["self", "event", "session_key", "text_content", "metadata", "reply_to",
+                            "is_ephemeral_response"],
 }
 _HANDLER_SHAPE = {"_json": ["self", "code", "payload"], "_error": ["self", "http_code", "req_id", "code", "message"],
                   "_client_ip": ["self"], "do_GET": ["self"]}
