@@ -582,9 +582,9 @@ def test_a_clarification_fails_with_its_journaled_cloud_terminal_on_get_list_and
     for task in (got["result"], listed["result"]["tasks"][0], task_of(again)):
         assert (task["id"], task["status"]["state"], task["metadata"]) == (task_id, protocol.STATE_FAILED, expected)
         assert _text(task) == text
-        if typed:  # the server's typed terminal task; it reads an absent artifacts list as [] (a2a-transport.ts)
+        if typed:  # the server's generated typed terminal task
             want = fixture(typed)["result"]
-            assert (task["status"]["state"], task.get("artifacts", []), task["metadata"].keys(),
+            assert (task["status"]["state"], task["artifacts"], task["metadata"].keys(),
                     task["metadata"][CLOUD_TERMINAL]) == (want["status"]["state"], want["artifacts"],
                                                           want["metadata"].keys(), want["metadata"][CLOUD_TERMINAL])
     row, = journaled(journal_path)
