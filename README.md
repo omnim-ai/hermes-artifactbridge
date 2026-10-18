@@ -224,10 +224,10 @@ server's requests (see Start headers).
   executor's configuration and every required capability is one of those six;
   otherwise it answers a JSON-RPC error and no result. The runner takes initial
   tasks only and does not claim `same_session_continuation`: a probe for the six
-  succeeds, and a probe that requires `same_session_continuation` (the current
-  server probe asks for all seven) is refused `capability_mismatch`. Aligning
-  the server's eligibility check to the six is owned server-side, outside this
-  plugin. It needs no start headers and never claims open-pool consent.
+  succeeds (the final server probe asks for exactly the six), and a probe that
+  requires `same_session_continuation` (the historical seven-capability probe)
+  is refused `capability_mismatch`. It needs no start headers and never claims
+  open-pool consent.
 - **Start headers.** Send, Get, List and Cancel must carry exactly one
   `X-AB-Pool-Protocol-Version: 1`, one `X-AB-Control-Credential: agx_...` and
   one `X-AB-Start-Journal-Id` (printable ASCII, at most 128). Anything missing,
@@ -348,9 +348,12 @@ server's requests (see Start headers).
   that row's reports are never retried or overtaken by a later sequence.
 
 **Server contract.** Routes, headers and shapes match artifact-forge
-`a26eb977c476d7b2efd1c636deaa7e74f31c50c2` (cloud-contract-r2) and its generated
-fixtures in `tests/fixtures/cloud_r2` (see `SOURCE.md`). That server code is not
-merged or deployed, and its CI database/runtime is not certified. Calls go to
+`e041a62ccf3e5df6f34ec226b3b85c9d5ceb3c82`
+(cloud-contract-r2-terminal-clarification-1) and its generated fixtures in
+`tests/fixtures/cloud_r2_terminal_clarification_1` (see `SOURCE.md`). That
+server code is local and unpushed, not merged or deployed, and its CI
+database/runtime is not certified. `tests/fixtures/cloud_r2` is the preserved
+historical archive (cloud-contract-r2, `a26eb977c`). Calls go to
 `POST /api/agent-gateway/pool/start`, `/bootstrap` and `/report` on the tools
 URL's origin with `Authorization: Bearer agx_...`; redirects are never
 followed. Status mapping: a contract 409 refusal (`start_owned`,

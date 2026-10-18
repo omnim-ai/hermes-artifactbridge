@@ -1,7 +1,8 @@
 """Pooled execution protocol v1: the assignment tuple, the dispatch envelope, the cloud start headers and
 the capability answer.
 
-Shapes follow the ArtifactBridge cloud-contract-r2 fixtures (tests/fixtures/cloud_r2). Every object is
+Shapes follow the ArtifactBridge cloud-contract-r2-terminal-clarification-1 fixtures
+(tests/fixtures/cloud_r2_terminal_clarification_1). Every object is
 strict: an unknown or missing key is a refusal, never a best-effort parse. The dispatch metadata never
 carries a ``dlt_`` token or any credential; this module never accepts one there.
 """

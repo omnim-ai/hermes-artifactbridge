@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "assignment_tuple_mismatch",
+    "message": "The request was refused."
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "scheduler_busy",
+    "message": "The scheduler is busy; retry the request."
+  },
+  "retryable": true
+}

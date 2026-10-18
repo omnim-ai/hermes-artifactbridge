@@ -1,5 +1,6 @@
 """In-process fake of the ArtifactBridge pooled control routes (src/routes/agent-gateway-pool.ts at
-artifact-forge a26eb977c), answering with the cloud-contract-r2 fixture statuses and bodies.
+artifact-forge e041a62cc), answering with the cloud-contract-r2-terminal-clarification-1 fixture statuses and
+bodies.
 
 - Every route authenticates with the ``agx_`` of the assignment its body names (``Bearer`` of the start
   headers' ``X-AB-Control-Credential``): 401 ``unauthorized-response.json`` for a missing, unknown or other
@@ -30,7 +31,7 @@ import httpx2
 START_PATH = "/api/agent-gateway/pool/start"
 BOOTSTRAP_PATH = "/api/agent-gateway/pool/bootstrap"
 REPORT_PATH = "/api/agent-gateway/pool/report"
-FIXTURES = Path(__file__).parent / "fixtures" / "cloud_r2"
+FIXTURES = Path(__file__).parent / "fixtures" / "cloud_r2_terminal_clarification_1"
 ORIGIN = "https://ab.test"
 TOOLS_URL = ORIGIN + "/mcp/agent-gateway"
 

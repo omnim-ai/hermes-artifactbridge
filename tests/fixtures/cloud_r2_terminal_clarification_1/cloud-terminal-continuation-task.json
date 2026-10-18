@@ -1,0 +1,36 @@
+{
+  "jsonrpc": "2.0",
+  "id": "00000000-0000-4000-8000-000000000000",
+  "result": {
+    "id": "remote-task-1",
+    "contextId": "abc-context-1",
+    "status": {
+      "state": "TASK_STATE_FAILED"
+    },
+    "artifacts": [],
+    "metadata": {
+      "artifactbridge.assignment": {
+        "protocolVersion": 1,
+        "binding": {
+          "workspaceId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000001",
+          "serviceId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000002",
+          "delegationId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000003",
+          "executionGeneration": 1,
+          "assignmentId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000004",
+          "executorId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000005",
+          "slotId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000006",
+          "reservationGeneration": "1",
+          "executorConnectionRevision": "1"
+        },
+        "dispatchId": "dispatch-1",
+        "commandSequence": 1,
+        "setupRevision": 1,
+        "startBy": "2026-10-17T12:00:00.000Z",
+        "startJournalId": "agj_6f1f7d9e0a1b4c2d8e3f000000000004"
+      },
+      "artifactbridge.cloudTerminal": {
+        "reason": "continuation_unsupported"
+      }
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "capability_probe_required",
+    "message": "A cloud executor is checked by the server's capability probe."
+  }
+}

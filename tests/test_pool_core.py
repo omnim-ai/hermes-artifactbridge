@@ -1,6 +1,7 @@
 """Pooled (assignment-bound) execution core, without Hermes: envelope strictness, the durable journal,
 start ownership, permit checks, restart recovery, sessions, cancel/report fencing, durable report
-delivery, and the control client's status mapping against the server contract (cloud-contract-r2)."""
+delivery, and the control client's status mapping against the server contract
+(cloud-contract-r2-terminal-clarification-1)."""
 import hashlib
 import json
 import logging
@@ -107,6 +108,7 @@ def test_every_fixture_parses_through_the_plugins_own_parsers():
     assert p.parse_start_response(fixture("cloud-start-replay-permit.json")) == ("permit", {**env, "startJournalId": journal})
     assert p.parse_start_response(fixture("cloud-start-owned-refusal.json")) == ("refused", "start_owned")
     assert p.parse_start_response(fixture("cloud-start-not-authorized-refusal.json")) == ("refused", "start_not_authorized")
+    # cloud-continuation-*: historical generation-2 negative shapes; they parse, but are never a start capability.
     cont = fixture("cloud-continuation-request.json")
     cont_env = envelope_from_metadata(cont["body"]["params"]["metadata"])
     cont_journal = cont["headers"]["x-ab-start-journal-id"]
@@ -122,17 +124,15 @@ def test_every_fixture_parses_through_the_plugins_own_parsers():
     assert credential == fixture("bootstrap-response.json")["credential"] and expires_at.isoformat() == "2026-10-17T11:15:00+00:00"
     capability = fixture("cloud-capability-request.json")["body"]
     assert capability["method"] == p.CAPABILITY_METHOD
-    # TL ruling: the full cloud set includes same_session_continuation, which this runner does not implement,
-    # so the fixture probe is refused (a deliberately ineligible runner); the supported subset is echoed.
+    assert capability["params"]["requiredCapabilities"] == list(IMPLEMENTED_CAPABILITIES)
+    assert p.capability_answer(capability["params"], executor_id=EXECUTOR_ID, connection_revision=REVISION,
+                               runtime_version="0.0.0-fixture") == fixture("cloud-capability-result.json")["result"]
+    # Historical input (tests/fixtures/cloud_r2): the old seven-capability probe also requires the withdrawn
+    # same_session_continuation, which this runner does not implement, so it is refused.
+    old_seven = json.loads((fake_pool.FIXTURES.parent / "cloud_r2" / "cloud-capability-request.json").read_text())
     with pytest.raises(Refused, match="capability_mismatch"):
-        p.capability_answer(capability["params"], executor_id=EXECUTOR_ID, connection_revision=REVISION,
+        p.capability_answer(old_seven["body"]["params"], executor_id=EXECUTOR_ID, connection_revision=REVISION,
                             runtime_version="0.0.0-fixture")
-    result = fixture("cloud-capability-result.json")["result"]
-    full = capability["params"]["requiredCapabilities"]
-    assert [c for c in full if c != "same_session_continuation"] == list(IMPLEMENTED_CAPABILITIES)
-    subset = {**capability["params"], "requiredCapabilities": list(IMPLEMENTED_CAPABILITIES)}
-    assert p.capability_answer(subset, executor_id=EXECUTOR_ID, connection_revision=REVISION,
-                               runtime_version="0.0.0-fixture") == {**result, "capabilities": list(IMPLEMENTED_CAPABILITIES)}
     # Legacy (integration-u3-r1) shapes, still generated: the same tuple; report shapes are unchanged.
     legacy = envelope_from_metadata(fixture("dispatch-metadata.json"))
     assert legacy == env == validate_envelope(fixture("mailbox-assignment-command.json")["envelope"])
@@ -169,12 +169,15 @@ def test_every_fixture_parses_through_the_plugins_own_parsers():
     # Driven against the real listener in tests/test_pool_adapter.py.
     listener = {"cloud-send-response.json", "cloud-continuation-response.json", "cloud-get-task-request.json",
                 "cloud-list-tasks-request.json", "cloud-cancel-request.json", "cloud-card-request.json",
-                "cloud-capability-error-method-not-found.json"}
-    # Server-side only: the server's own probe verdicts and records, SQL row schema examples (not runtime
-    # receipts), connection API responses, the retired tray capability routes and the U2 revision fence.
-    server_only = {"cloud-capability-proof-record.json", "cloud-capability-verdict-missing-capability.json",
-                   "cloud-capability-verdict-wrong-nonce.json", "cloud-capability-verdict-wrong-protocol.json",
-                   "cloud-transport-row.json", "cloud-continuation-transport-row.json", "cloud-prepare-receipt-row.json",
+                "cloud-capability-error-method-not-found.json", "cloud-terminal-clarification-task.json",
+                "cloud-terminal-clarification-null-question-task.json", "cloud-terminal-continuation-task.json",
+                "cloud-capability-verdict-old-seven.json", "cloud-capability-verdict-unknown-capability.json",
+                "cloud-capability-verdict-duplicate-capability.json", "cloud-capability-verdict-missing-capability.json",
+                "cloud-capability-verdict-wrong-nonce.json", "cloud-capability-verdict-wrong-protocol.json"}
+    # Server-side only: the server's own probe record, SQL row schema examples (not runtime receipts),
+    # connection API responses, the retired tray capability routes and the U2 revision fence.
+    server_only = {"cloud-capability-proof-record.json", "cloud-transport-row.json",
+                   "cloud-continuation-transport-row.json", "cloud-prepare-receipt-row.json",
                    "cloud-connections-due-check-row.json", "cloud-connection-response.json",
                    "cloud-probe-failed-response.json", "capability-challenge.json", "capability-proof.json",
                    "capability-response.json", "capability-refusal-response.json",

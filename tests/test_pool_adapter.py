@@ -1,7 +1,8 @@
 """The ``artifactbridge-pool`` listener over real HTTP against the real Hermes stock A2A adapter and the real
-Hermes message pipeline (skipped without Hermes). Requests are the generated cloud-contract-r2 fixtures
-(tests/fixtures/cloud_r2), sent to the listener's real ``connect()`` socket with the server's headers; only
-the model (``_message_handler``) and the server's control routes (FakeControl) are stand-ins."""
+Hermes message pipeline (skipped without Hermes). Requests are the generated
+cloud-contract-r2-terminal-clarification-1 fixtures (tests/fixtures/cloud_r2_terminal_clarification_1), sent
+to the listener's real ``connect()`` socket with the server's headers; only the model (``_message_handler``)
+and the server's control routes (FakeControl) are stand-ins."""
 import asyncio
 import contextlib
 import copy
@@ -329,20 +330,32 @@ def test_the_card_pins_the_registered_listener_url_on_the_jsonrpc_binding(listen
 
 
 def test_the_capability_request_is_answered_from_this_executors_configuration(listener, server):
-    # Product ruling: the six supported capabilities are answered; the generated probe still requires the
-    # withdrawn same_session_continuation and is refused, never answered with a capability it lacks.
-    body = copy.deepcopy(fixture("cloud-capability-request.json")["body"])
-    body["params"]["requiredCapabilities"].remove("same_session_continuation")
-    status, answer = listener.call("cloud-capability-request.json", body=body)
+    status, answer = listener.call("cloud-capability-request.json")
     expected = fixture("cloud-capability-result.json")
     assert status == 200 and answer["id"] == expected["id"]
-    assert answer["result"] == {**expected["result"], "runtimeVersion": plugin_module.VERSION,
-                                "capabilities": body["params"]["requiredCapabilities"]}
-    status, refused = listener.call("cloud-capability-request.json")
+    assert answer["result"] == {**expected["result"], "runtimeVersion": plugin_module.VERSION}
+    # Historical input (tests/fixtures/cloud_r2, cloud-contract-r2): the old seven-capability probe also requires
+    # the withdrawn same_session_continuation and is refused, never answered with a capability this runner lacks.
+    old_seven = json.loads((fake_pool.FIXTURES.parent / "cloud_r2" / "cloud-capability-request.json").read_text())
+    status, refused = listener.call("cloud-capability-request.json", headers=old_seven["headers"],
+                                    body=old_seven["body"])
     assert status == 200 and "result" not in refused
     assert refused["error"] == {**refused["error"], "code": protocol.ERR_INVALID_PARAMS,
                                 "message": "ArtifactBridge pooled dispatch refused: capability_mismatch"}
     assert server.requests == [] and listener.model.turns == []
+
+
+def test_the_capability_answer_is_none_of_the_shapes_the_servers_verdicts_judge_incompatible(listener):
+    six = fixture("cloud-capability-request.json")["body"]["params"]["requiredCapabilities"]
+    answered = listener.call("cloud-capability-request.json")[1]["result"]["capabilities"]
+    assert answered == six and len(set(answered)) == 6 and "same_session_continuation" not in answered
+    # The judged answers: old seven (six + same_session_continuation), six + an unknown name, six + a repeat.
+    assert answered not in (six + ["same_session_continuation"], six + ["unknown_capability"], six + six[:1])
+    incompatible = {"outcome": "failed", "reasonCode": "unsupported", "incompatible": True}
+    for name in ("old-seven", "unknown-capability", "duplicate-capability", "missing-capability", "wrong-protocol"):
+        assert fixture(f"cloud-capability-verdict-{name}.json") == incompatible
+    # A wrong nonce fails the probe without marking the runtime incompatible.
+    assert fixture("cloud-capability-verdict-wrong-nonce.json") == {**incompatible, "incompatible": False}
 
 
 @pytest.mark.parametrize("change", [{"executorConnectionRevision": "2"}, {"protocolVersion": 2},
@@ -517,6 +530,7 @@ CANNOT_RESUME = ("This cloud task cannot resume. Send the task again as a new re
                  "context it needs.")
 CLOUD_TERMINAL = "artifactbridge.cloudTerminal"
 ASKED = {"reason": "clarification_unsupported", "question": "Which tone?"}
+REGION = fixture("cloud-terminal-clarification-task.json")["result"]["metadata"][CLOUD_TERMINAL]["question"]
 WIDE = "\U0001F600" * 19_999 + "é"  # 20,000 code points: 40,000 UTF-16 units, yet within the code-point limit
 BINDING = envelope()["binding"]
 
@@ -524,9 +538,7 @@ BINDING = envelope()["binding"]
 def _asked(listener, server, reply) -> str:
     """The six-capability handshake, then the fixture Send whose one turn replies ``reply``; returns its task id
     once its finalizer recorded the outcome."""
-    body = copy.deepcopy(fixture("cloud-capability-request.json")["body"])
-    body["params"]["requiredCapabilities"].remove("same_session_continuation")
-    assert "result" in listener.call("cloud-capability-request.json", body=body)[1]
+    assert "result" in listener.call("cloud-capability-request.json")[1]
     listener.model.behavior[0] = reply
     server.issue(envelope())
     _, sent = listener.call("cloud-send-request.json")
@@ -539,15 +551,18 @@ def _text(task) -> str:
     return "".join(part["text"] for part in task["status"]["message"]["parts"])
 
 
-@pytest.mark.parametrize("reply, terminal, text", [
-    ("[INPUT_REQUIRED] Which tone?", ASKED, f"{UNCONFIRMED}\n\nWhich tone?"),
-    ("[input_required] \n ", {"reason": "clarification_unsupported", "question": None}, UNAVAILABLE),
+@pytest.mark.parametrize("reply, terminal, text, typed", [
+    ("[INPUT_REQUIRED] Which tone?", ASKED, f"{UNCONFIRMED}\n\nWhich tone?", None),
+    (f"[INPUT_REQUIRED] {REGION}", {"reason": "clarification_unsupported", "question": REGION},
+     f"{UNCONFIRMED}\n\n{REGION}", "cloud-terminal-clarification-task.json"),
+    ("[input_required] \n ", {"reason": "clarification_unsupported", "question": None}, UNAVAILABLE,
+     "cloud-terminal-clarification-null-question-task.json"),
     (f"[INPUT_REQUIRED]\n {WIDE} \n", {"reason": "clarification_unsupported", "question": WIDE},
-     f"{UNCONFIRMED}\n\n{WIDE}"),
-    (f"[INPUT_REQUIRED] {WIDE}x", None, "outcome_too_long"),  # 20,001: the generic failure, never cut short
-], ids=["question", "empty-is-null", "20000-code-points", "20001-is-outcome-too-long"])
+     f"{UNCONFIRMED}\n\n{WIDE}", None),
+    (f"[INPUT_REQUIRED] {WIDE}x", None, "outcome_too_long", None),  # 20,001: the generic failure, never cut short
+], ids=["question", "fixture-question", "empty-is-null", "20000-code-points", "20001-is-outcome-too-long"])
 def test_a_clarification_fails_with_its_journaled_cloud_terminal_on_get_list_and_a_resent_send(
-        listener, server, journal_path, monkeypatch, reply, terminal, text):
+        listener, server, journal_path, monkeypatch, reply, terminal, text, typed):
     seen, report = [], server._report
 
     def observed(body):  # the stopped report goes out after the journal commit, before the volatile TaskStore
@@ -567,6 +582,11 @@ def test_a_clarification_fails_with_its_journaled_cloud_terminal_on_get_list_and
     for task in (got["result"], listed["result"]["tasks"][0], task_of(again)):
         assert (task["id"], task["status"]["state"], task["metadata"]) == (task_id, protocol.STATE_FAILED, expected)
         assert _text(task) == text
+        if typed:  # the server's typed terminal task; it reads an absent artifacts list as [] (a2a-transport.ts)
+            want = fixture(typed)["result"]
+            assert (task["status"]["state"], task.get("artifacts", []), task["metadata"].keys(),
+                    task["metadata"][CLOUD_TERMINAL]) == (want["status"]["state"], want["artifacts"],
+                                                          want["metadata"].keys(), want["metadata"][CLOUD_TERMINAL])
     row, = journaled(journal_path)
     assert (row["state"], row["result_state"], row["result_text"]) == ("finished", "failed", text)
     assert seen == [(protocol.STATE_WORKING, "finished", row["cloud_terminal"])]
@@ -717,6 +737,7 @@ def test_conflicting_duplicate_finalizer_callbacks_publish_only_the_journaled_wi
 def test_the_fixture_continuation_after_a_clarification_is_rejected_with_no_turn_session_or_control_call(
         listener, server, journal_path):
     _asked(listener, server, "[INPUT_REQUIRED] Which tone?")
+    # cloud-continuation-*: historical generation-2 negative inputs, never an allocation or a start capability.
     server.issue(fixture("cloud-continuation-envelope.json"))
     before = len(server.requests)
     for _ in range(2):
@@ -724,6 +745,9 @@ def test_the_fixture_continuation_after_a_clarification_is_rejected_with_no_turn
         task = task_of(answer)
         assert task["status"]["state"] == protocol.STATE_REJECTED and _text(task) == CANNOT_RESUME
         assert task["metadata"] == {CLOUD_TERMINAL: {"reason": "continuation_unsupported"}}
+        # Unbound rejection: REJECTED with no assignment metadata (the server accepts FAILED or REJECTED).
+        assert task["metadata"][CLOUD_TERMINAL] == (
+            fixture("cloud-terminal-continuation-task.json")["result"]["metadata"][CLOUD_TERMINAL])
     assert len(listener.model.turns) == 1 and server.requests[before:] == []  # no start, bootstrap or report
     assert journaled(journal_path, fixture("cloud-continuation-request.json")["headers"]["x-ab-start-journal-id"]) == []
 
