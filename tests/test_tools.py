@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from hermes_artifactbridge.schemas import TOOL_NAMES
 from tests import fake_ab
@@ -325,6 +326,50 @@ async def test_space_tool_refusals_are_preserved_without_renewal_retry_or_fallba
     assert await _run(registered_tools, name, {"delegation_token": token, **args}) == reply
     assert ab.tool_calls == [(name, args)] and ab.renew_calls == 0
     _only_tool_path(ab)
+
+
+# ---- space_role (a task's agent and room roots): forwarded verbatim and only when given; the server picks the
+# root, refuses an invalid role, an unbound root or a foreign space_id. No local check, default or fallback.
+ROLE_REFUSALS = [
+    ({"space_role": "both"}, {"error": "invalid_arguments", "message": "space_role must be agent or room"}),
+    ({"space_role": "room"}, {"error": "space_not_bound", "delegation_id": "del-1"}),
+    ({"space_role": "agent", "space_id": SPACE_ID}, {"error": "space_out_of_scope", "delegation_id": "del-1"}),
+    ({"space_role": "room", "space_id": SPACE_ID}, {"error": "space_out_of_scope", "delegation_id": "del-1"}),
+]
+
+
+def _legacy_headers_only(ab, token) -> None:
+    assert ab.requests and all(r["token"] == token and r["authorization"] == f"Bearer {fake_ab.SERVICE_CREDENTIAL}"
+                               for r in ab.requests)  # never a dlc_
+    _only_tool_path(ab)
+
+
+@pytest.mark.parametrize("role", [None, "agent", "room"])
+@pytest.mark.parametrize("name, args", SPACE_TOOLS)
+async def test_space_role_is_forwarded_exactly_and_omitted_stays_off_the_wire(registered_tools, ab, token, monkeypatch,
+                                                                              name, args, role):
+    reply = SPACE_PAGE1 if name == READ_SPACE else _skill_reply("registered")
+    _script(monkeypatch, name, reply)
+    selector = {} if role is None else {"space_role": role}
+    Draft202012Validator(registered_tools[name]["schema"]["parameters"]).validate(
+        {"delegation_token": token, **args, **selector})
+    assert await _run(registered_tools, name, {"delegation_token": token, **args, **selector}) == reply
+    assert ab.tool_calls == [(name, {**args, **selector})] and ab.renew_calls == 0  # omitted: the agent-only payload
+    _legacy_headers_only(ab, token)
+
+
+@pytest.mark.parametrize("selectors, payload", ROLE_REFUSALS, ids=["invalid-role", "room-not-bound",
+                                                                   "agent-foreign-space", "room-foreign-space"])
+@pytest.mark.parametrize("name, args", SPACE_TOOLS)
+async def test_space_role_refusals_are_the_servers_returned_unchanged(registered_tools, ab, token, monkeypatch,
+                                                                      name, args, selectors, payload):
+    if name == READ_SKILL:
+        selectors = {k: v for k, v in selectors.items() if k != "space_id"}  # read_skill takes no space_id
+    reply = _reply(payload, True)
+    _script(monkeypatch, name, reply)  # a second call would exhaust the script and fail
+    assert await _run(registered_tools, name, {"delegation_token": token, **args, **selectors}) == reply
+    assert ab.tool_calls == [(name, {**args, **selectors})] and ab.renew_calls == 0
+    _legacy_headers_only(ab, token)
 
 
 @pytest.mark.parametrize("name, args", SPACE_TOOLS)

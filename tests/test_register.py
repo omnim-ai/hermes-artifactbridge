@@ -8,7 +8,8 @@ import pytest
 
 import hermes_artifactbridge as plugin_module
 from hermes_artifactbridge import SKILL_PATH, register
-from hermes_artifactbridge.schemas import RESERVED_ARGS, TOKEN_ARG, TOOL_NAMES, TOOL_SCHEMAS, TOOLSET
+from hermes_artifactbridge.schemas import (POOL_TOOL_SCHEMAS, POOL_WIRE_NAMES, RESERVED_ARGS, TOKEN_ARG, TOOL_NAMES,
+                                           TOOL_SCHEMAS, TOOLSET)
 from tests import fake_ab
 from tests.conftest import FakeCtx
 
@@ -133,6 +134,8 @@ CONTRACT_PROXY_SCHEMAS = {
             "delegation_token": {"type": "string", "minLength": 1},
             "delegation_id": {"type": "string"},
             "space_id": {"type": "string", "format": "uuid"},
+            "space_role": {"type": "string", "enum": ["agent", "room"],
+                           "description": "Which of this task's spaces to read: agent (default) or room."},
             "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
             "cursor": {"type": "string", "minLength": 1},
             "include_archived": {"type": "boolean", "default": False},
@@ -146,6 +149,9 @@ CONTRACT_PROXY_SCHEMAS = {
             "delegation_id": {"type": "string"},
             "slug": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
             "version_policy": {"type": "string", "enum": ["registered", "current"], "default": "registered"},
+            "space_role": {"type": "string", "enum": ["agent", "room"],
+                           "description": "Optional: read the skill only through this space (agent or room). "
+                                          "Omitted: through any of this task's spaces."},
         },
         "required": ["delegation_token", "slug"],
     },
@@ -164,6 +170,20 @@ def test_space_tools_use_the_contract_proxy_schemas():
     assert not validate({"delegation_token": "", "slug": "a"})
     assert not validate({"delegation_token": "t", "slug": "Bad"})
     assert not validate({"delegation_token": "t", "slug": "a", "version_policy": "latest"})
+
+
+@pytest.mark.parametrize("name, args", [(READ_SPACE_CONTEXT, {}), (READ_SKILL, {"slug": "a"})])
+def test_space_role_is_an_optional_two_value_enum_on_the_legacy_and_pooled_space_tools(name, args):
+    legacy = next(s for s in TOOL_SCHEMAS if s["name"] == name)["parameters"]
+    pooled = next(p for p in POOL_TOOL_SCHEMAS if POOL_WIRE_NAMES[p["name"]] == name)["parameters"]
+    for params, base in ((legacy, {"delegation_token": "t", **args}), (pooled, args)):
+        role = params["properties"]["space_role"]
+        assert role["type"] == "string" and role["enum"] == ["agent", "room"] and "default" not in role
+        assert "space_role" not in params["required"] and "additionalProperties" not in params  # unchanged: absent
+        validate = Draft202012Validator(params).is_valid
+        assert validate(base) and validate({**base, "space_role": "agent"}) and validate({**base, "space_role": "room"})
+        assert not validate({**base, "space_role": "both"}) and not validate({**base, "space_role": None})
+    assert TOKEN_ARG not in pooled["properties"] and TOKEN_ARG not in pooled["required"]
 
 
 def test_schemas_are_static_require_token_and_restrict_authority_selectors():
