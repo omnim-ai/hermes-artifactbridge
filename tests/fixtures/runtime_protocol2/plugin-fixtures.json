@@ -1,0 +1,68 @@
+{
+ "note": "Pure fixtures copied from test/ai4179-runtime-protocol.test.ts. Not a paired-runtime proof.",
+ "cloudV2Challenge": {
+  "kind": "cloud",
+  "protocolVersion": 2,
+  "executorId": "7b0e3f2a-4c1d-4e8b-9a6f-2d5c8e1b3a90",
+  "executorConnectionRevision": "7",
+  "setupRevision": 3,
+  "nonce": "q3VbX9kLm2Rt7YwZp4Hc8NsJd6Fg1Ae5",
+  "expiresAt": "2026-10-19T12:05:00.000Z"
+ },
+ "cloudV2Answer": {
+  "protocolVersion": 2,
+  "executorId": "7b0e3f2a-4c1d-4e8b-9a6f-2d5c8e1b3a90",
+  "executorConnectionRevision": "7",
+  "nonce": "q3VbX9kLm2Rt7YwZp4Hc8NsJd6Fg1Ae5",
+  "capabilities": [
+   "assignment_tuple_start_ownership",
+   "scoped_space_document_skill",
+   "per_task_credentials_fresh_sessions",
+   "durable_inspect_recovery",
+   "cancel_report_fencing",
+   "cloud_start_headers_v1",
+   "room_space_context_v1"
+  ],
+  "runtimeVersion": "hermes-2.0.0"
+ },
+ "exactSets": {
+  "cloud": {
+   "1": [
+    "assignment_tuple_start_ownership",
+    "scoped_space_document_skill",
+    "per_task_credentials_fresh_sessions",
+    "durable_inspect_recovery",
+    "cancel_report_fencing",
+    "cloud_start_headers_v1"
+   ],
+   "2": [
+    "assignment_tuple_start_ownership",
+    "scoped_space_document_skill",
+    "per_task_credentials_fresh_sessions",
+    "durable_inspect_recovery",
+    "cancel_report_fencing",
+    "cloud_start_headers_v1",
+    "room_space_context_v1"
+   ]
+  },
+  "tray": {
+   "1": [
+    "assignment_tuple_start_ownership",
+    "scoped_space_document_skill",
+    "per_task_credentials_fresh_sessions",
+    "same_session_continuation",
+    "durable_inspect_recovery",
+    "cancel_report_fencing"
+   ],
+   "2": [
+    "assignment_tuple_start_ownership",
+    "scoped_space_document_skill",
+    "per_task_credentials_fresh_sessions",
+    "same_session_continuation",
+    "durable_inspect_recovery",
+    "cancel_report_fencing",
+    "room_space_context_v1"
+   ]
+  }
+ }
+}
