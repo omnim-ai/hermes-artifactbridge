@@ -30,9 +30,12 @@ CI runs only the self-contained tests below.
   `create_document` accepts `room_id`, to opt into an HTML Room artifact. The
   backend checks that it is the delegation's Room; the plugin strips `room_id`
   from all other tools.
-- The Space tools forward `space_id`, `cursor`, `limit`, `include_archived`,
-  `slug` and `version_policy` unchanged and only when given; ArtifactBridge
-  owns their defaults. They return ArtifactBridge's MCP result unchanged as
+- The Space tools forward `space_id`, `space_role`, `cursor`, `limit`,
+  `include_archived`, `slug` and `version_policy` unchanged and only when
+  given; ArtifactBridge owns their defaults. `space_role` (`agent` or `room`)
+  picks which of a task's spaces to read; the plugin never validates, defaults
+  or falls back between roles, and an omitted role stays off the wire. They
+  return ArtifactBridge's MCP result unchanged as
   `{"content": [...], "isError": bool}`, including every refusal such as
   `space_unavailable`, `invalid_cursor` or `skill_not_found`. A tool the
   server does not offer returns its JSON-RPC error as `{"error": {"code",
@@ -227,7 +230,17 @@ server's requests (see Start headers).
   succeeds (the final server probe asks for exactly the six), and a probe that
   requires `same_session_continuation` (the historical seven-capability probe)
   is refused `capability_mismatch`. It needs no start headers and never claims
-  open-pool consent.
+  open-pool consent. That is runtime capability protocol 1, unchanged. A
+  protocol 2 probe must require exactly the six plus `room_space_context_v1`
+  (seven names, each once, any order) and is answered with protocol version 2
+  and those seven; anything else, `same_session_continuation` included, is
+  refused `capability_mismatch`. A protocol 1 probe is never answered with
+  seven, nor a protocol 2 probe with protocol 1. The runtime capability
+  protocol is separate from the assignment protocol: the envelope,
+  `X-AB-Pool-Protocol-Version: 1` and the start and bootstrap bodies stay
+  protocol 1. Protocol 2 is unreleased: the server's protocol 2 recording and
+  matching are not merged or deployed, and no real paired handshake has been
+  proven.
 - **Start headers.** Send, Get, List and Cancel must carry exactly one
   `X-AB-Pool-Protocol-Version: 1`, one `X-AB-Control-Credential: agx_...` and
   one `X-AB-Start-Journal-Id` (printable ASCII, at most 128). Anything missing,
