@@ -1,5 +1,5 @@
 """Pooled execution protocol v1: the assignment tuple, the dispatch envelope, the cloud start headers and
-the capability answer.
+the capability answer (runtime capability protocol 1 or 2, versioned separately).
 
 Shapes follow the ArtifactBridge cloud-contract-r2-terminal-clarification-1 fixtures
 (tests/fixtures/cloud_r2_terminal_clarification_1). Every object is
@@ -60,6 +60,12 @@ IMPLEMENTED_CAPABILITIES = (
     "cancel_report_fencing",
     "cloud_start_headers_v1",
 )
+# The runtime capability protocol (the capability probe's ``protocolVersion``) is versioned separately from the
+# assignment protocol (PROTOCOL_VERSION: envelope, start headers, start and bootstrap bodies, still 1). Each
+# version's probe must require exactly its set (artifact-forge src/agent-gateway/runtime-protocol.ts, cloud kind);
+# version 2 adds the task's room Space root to the six.
+ROOM_SPACE_CONTEXT_CAPABILITY = "room_space_context_v1"
+RUNTIME_PROTOCOL_CAPABILITIES = {1: IMPLEMENTED_CAPABILITIES, 2: (*IMPLEMENTED_CAPABILITIES, ROOM_SPACE_CONTEXT_CAPABILITY)}
 _CAPABILITY_KEYS = frozenset({"protocolVersion", "executorId", "executorConnectionRevision", "nonce",
                               "requiredCapabilities"})
 
@@ -231,10 +237,20 @@ def pool_grant(values: Callable[[str], list[str] | None]) -> tuple[str, str]:
 def capability_answer(params: object, *, executor_id: str, connection_revision: str, runtime_version: str) -> dict:
     """cloud-capability-result.json ``result`` for a strict cloud-capability-request.json ``params``
     addressed to this executor, else ``Refused("capability_mismatch")``. The answer lists only what this
-    plugin implements and claims no open-pool consent."""
+    plugin implements and claims no open-pool consent. Runtime protocol 1 answers the six for any non-empty
+    subset of them; protocol 2 answers the seven only to a probe requiring exactly the seven, each once."""
     if not isinstance(params, dict) or set(params) != _CAPABILITY_KEYS:
         raise Refused("capability_mismatch")
     nonce, required = params["nonce"], params["requiredCapabilities"]
+    if type(params["protocolVersion"]) is int and params["protocolVersion"] == 2:
+        seven = RUNTIME_PROTOCOL_CAPABILITIES[2]
+        if (params["executorId"] != executor_id or params["executorConnectionRevision"] != connection_revision
+                or not isinstance(nonce, str) or not 32 <= len(nonce) <= 128
+                or not isinstance(required, list) or len(required) != len(seven)
+                or not all(isinstance(c, str) for c in required) or set(required) != set(seven)):
+            raise Refused("capability_mismatch")
+        return {"protocolVersion": 2, "executorId": executor_id, "executorConnectionRevision": connection_revision,
+                "nonce": nonce, "capabilities": list(seven), "runtimeVersion": runtime_version}
     if (type(params["protocolVersion"]) is not int or params["protocolVersion"] != PROTOCOL_VERSION
             or params["executorId"] != executor_id or params["executorConnectionRevision"] != connection_revision
             or not isinstance(nonce, str) or not 32 <= len(nonce) <= 128

@@ -358,6 +358,66 @@ def test_the_capability_answer_is_none_of_the_shapes_the_servers_verdicts_judge_
     assert fixture("cloud-capability-verdict-wrong-nonce.json") == {**incompatible, "incompatible": False}
 
 
+SIX = fixture("cloud-capability-request.json")["body"]["params"]["requiredCapabilities"]
+SEVEN = [*SIX, "room_space_context_v1"]
+
+
+def capability_v2(**change) -> dict:
+    """The fixture capability request as a runtime protocol 2 probe for the seven, plus ``change``."""
+    body = copy.deepcopy(fixture("cloud-capability-request.json")["body"])
+    body["params"].update({"protocolVersion": 2, "requiredCapabilities": SEVEN, **change})
+    return body
+
+
+@pytest.mark.parametrize("required", [SEVEN, SEVEN[::-1]], ids=["fixed-order", "reordered"])
+def test_a_protocol_2_probe_for_exactly_the_seven_is_answered_with_the_seven(listener, server, journal_path, required):
+    body = capability_v2(requiredCapabilities=required)
+    status, answer = listener.call("cloud-capability-request.json", body=body)
+    assert (status, answer) == (200, {"jsonrpc": "2.0", "id": body["id"], "result": {
+        "protocolVersion": 2, "executorId": EXECUTOR_ID, "executorConnectionRevision": REVISION,
+        "nonce": body["params"]["nonce"], "capabilities": SEVEN, "runtimeVersion": plugin_module.VERSION}})
+    assert server.requests == [] and listener.model.turns == [] and no_tasks(listener) and journaled(journal_path) == []
+    # Protocol 1 is unchanged: the six, never the seven.
+    assert listener.call("cloud-capability-request.json")[1]["result"]["capabilities"] == SIX
+
+
+@pytest.mark.parametrize("change", [
+    {"requiredCapabilities": SIX},
+    {"requiredCapabilities": SEVEN[1:]},
+    {"requiredCapabilities": [*SEVEN, "same_session_continuation"]},
+    {"requiredCapabilities": [*SEVEN, SEVEN[0]]},
+    {"requiredCapabilities": [*SEVEN[:-1], SEVEN[0]]},
+    {"requiredCapabilities": [*SIX, "unknown_capability"]},
+    {"requiredCapabilities": [*SIX, "same_session_continuation"]},
+    {"requiredCapabilities": []},
+    {"requiredCapabilities": ",".join(SEVEN)},
+    {"executorId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000042"},
+    {"executorConnectionRevision": "2"},
+    {"nonce": "N" * 31},
+    {"protocolVersion": 3},
+    {"protocolVersion": "2"},
+    {"protocolVersion": True},
+], ids=["six", "missing-one", "eight", "duplicate", "duplicate-for-missing", "unknown", "same-session-continuation", "empty",
+        "not-a-list", "wrong-executor", "wrong-revision", "short-nonce", "protocol-3", "protocol-string",
+        "protocol-bool"])
+def test_a_protocol_2_probe_other_than_exactly_the_seven_is_refused_capability_mismatch(listener, server, journal_path,
+                                                                                         change):
+    status, answer = listener.call("cloud-capability-request.json", body=capability_v2(**change))
+    assert status == 200 and "result" not in answer
+    assert answer["error"] == {**answer["error"], "code": protocol.ERR_INVALID_PARAMS,
+                               "message": "ArtifactBridge pooled dispatch refused: capability_mismatch"}
+    assert server.requests == [] and listener.model.turns == [] and no_tasks(listener) and journaled(journal_path) == []
+
+
+@pytest.mark.parametrize("authorization", [None, "Bearer " + "W" * 43], ids=["absent", "wrong"])
+def test_an_unauthenticated_protocol_2_probe_is_401_before_anything(listener, server, journal_path, authorization):
+    extra = [("authorization", authorization)] if authorization else []
+    status, answer = listener.call("cloud-capability-request.json", body=capability_v2(), drop=("authorization",),
+                                   extra=extra)
+    assert (status, answer["error"]["code"], "result" in answer) == (401, protocol.ERR_UNAUTHORIZED, False)
+    assert server.requests == [] and listener.model.turns == [] and no_tasks(listener) and journaled(journal_path) == []
+
+
 @pytest.mark.parametrize("change", [{"executorConnectionRevision": "2"}, {"protocolVersion": 2},
                                     {"requiredCapabilities": ["open_pool_consent", "pool_lease_v1"]}],
                          ids=["other-revision", "other-protocol", "missing-capability"])
