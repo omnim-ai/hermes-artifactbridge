@@ -88,6 +88,7 @@ _DELEGATION_SCHEMAS: tuple[dict, ...] = (
 
 # Space-bound reads: the hosted proxy schemas of the AI-3948 plugin tool contract, verbatim apart from
 # descriptions. Optional fields carry the server's defaults as documentation; the plugin never inserts them.
+# AI-4128 adds space_role (the task's agent or room root), forwarded verbatim and only when given.
 _NONEMPTY_TOKEN_PROPERTY = {"type": "string", "minLength": 1}
 SPACE_TOOL_SCHEMAS: tuple[dict, ...] = (
     {"name": "artifactbridge_read_space_context",
@@ -99,6 +100,8 @@ SPACE_TOOL_SCHEMAS: tuple[dict, ...] = (
          TOKEN_ARG: _NONEMPTY_TOKEN_PROPERTY,
          "delegation_id": {"type": "string"},
          "space_id": {"type": "string", "format": "uuid"},
+         "space_role": {"type": "string", "enum": ["agent", "room"],
+                        "description": "Which of this task's spaces to read: agent (default) or room."},
          "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
          "cursor": {"type": "string", "minLength": 1},
          "include_archived": {"type": "boolean", "default": False},
@@ -112,6 +115,9 @@ SPACE_TOOL_SCHEMAS: tuple[dict, ...] = (
          "delegation_id": {"type": "string"},
          "slug": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
          "version_policy": {"type": "string", "enum": ["registered", "current"], "default": "registered"},
+         "space_role": {"type": "string", "enum": ["agent", "room"],
+                        "description": "Optional: read the skill only through this space (agent or room). "
+                                       "Omitted: through any of this task's spaces."},
      }, "required": [TOKEN_ARG, "slug"]}},
 )
 SPACE_TOOL_NAMES = frozenset(s["name"] for s in SPACE_TOOL_SCHEMAS)

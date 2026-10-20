@@ -46,6 +46,19 @@ service participant of one Room. Nothing here changes how you otherwise work.
   cannot load the Space and ask the sender what to do using `[INPUT_REQUIRED]`.
   Never fall back to a folder or proceed pretending you read it.
   Report other errors as given; do not restart paging on `invalid_cursor`.
+- A task can come with two spaces. The task text names each one: "agent
+  space", "room space", both labels on the "same Space", a generic pointer, or
+  "unavailable". Read each bound space with `space_role`: `"agent"` says how
+  to work (instructions, skills), `"room"` is the subject (the Room's
+  material). Without `space_role` you read the agent space, so an agent-only
+  task needs nothing more. Read the same Space under both labels once.
+- For a skill, omit `space_role` to read it through either space, or pass one
+  to restrict it to that space. Each read goes through ArtifactBridge when you
+  need it; do not cache or merge the two spaces.
+- If a space is unavailable or cannot be read, or the two spaces'
+  instructions conflict, say so in this task's Room and ask what to do before
+  the affected work. Never switch to a personal token or login, and never
+  claim you loaded both. Neither space grants write authority.
 - Call it "the Space". Never post its name or id in the Room.
   Space reads grant no write authority; only propose changes to task-listed
   writable documents. Space-reached external documents are cached and

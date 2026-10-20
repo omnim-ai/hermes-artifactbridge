@@ -168,6 +168,38 @@ async def test_reserved_args_and_a_model_supplied_token_are_stripped_like_legacy
     assert all(r["token"] == "" for r in ab.requests)
 
 
+POOL_SPACE_TOOLS = (("artifactbridge_pool_read_space_context", {}), (POOL_READ_SKILL, {"slug": "brand-voice"}))
+SPACE_ID = "20000000-0000-4000-8000-000000000001"
+
+
+def _server_replies(monkeypatch, wire: str, reply: dict) -> None:
+    once = iter([reply])  # a second call would exhaust the script and fail
+    monkeypatch.setitem(fake_ab.TOOLS, wire, lambda *a: next(once))
+
+
+@pytest.mark.parametrize("selectors, reply", [
+    ({}, fake_ab._text({"space": {"id": "space-agent"}})),
+    ({"space_role": "agent"}, fake_ab._text({"space": {"id": "space-agent"}})),
+    ({"space_role": "room"}, fake_ab._text({"space": {"id": "space-room"}})),
+    ({"space_role": "both"}, fake_ab._text({"error": "invalid_arguments", "message": "space_role must be agent or room"}, True)),
+    ({"space_role": "room"}, fake_ab._text({"error": "space_not_bound", "delegation_id": "del-1"}, True)),
+    ({"space_role": "room", "space_id": SPACE_ID}, fake_ab._text({"error": "space_out_of_scope", "delegation_id": "del-1"}, True)),
+], ids=["omitted", "agent", "room", "invalid-role", "room-not-bound", "room-foreign-space"])
+@pytest.mark.parametrize("name, args", POOL_SPACE_TOOLS)
+async def test_pooled_space_role_is_forwarded_verbatim_with_only_the_bound_dlc(pooled, ab, credentials, monkeypatch,
+                                                                               name, args, selectors, reply):
+    if name == POOL_READ_SKILL:
+        selectors = {k: v for k, v in selectors.items() if k != "space_id"}  # read_skill takes no space_id
+    wire = POOL_WIRE_NAMES[name]
+    _server_replies(monkeypatch, wire, reply)
+    in_session(POOL_PLATFORM, "ctx-a", "task-a")
+    assert json.loads(await pooled.handler_for(name)({**args, **selectors}, task_id="t")) == reply
+    assert ab.tool_calls == [(wire, {**args, **selectors})]  # omitted: the agent-only payload, no space_role key
+    assert ab.requests and all((r["authorization"], r["token"], r["path"]) == (f"Bearer {DLC_A}", "", fake_ab.TOOLS_PATH)
+                               for r in ab.requests)  # no dlt_, no service credential
+    assert credentials.renewals == [] and ab.renew_calls == 0
+
+
 async def test_legacy_tools_refuse_inside_a_pooled_session(registered_tools, ab, token):
     in_session(POOL_PLATFORM, "ctx-a", "task-a")
     for name, tool in registered_tools.items():

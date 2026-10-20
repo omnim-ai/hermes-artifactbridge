@@ -1,0 +1,29 @@
+{
+  "method": "POST",
+  "url": "https://runner.example.invalid/a2a/jsonrpc",
+  "headers": {
+    "accept": "application/json",
+    "authorization": "Bearer RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR",
+    "content-type": "application/json"
+  },
+  "body": {
+    "jsonrpc": "2.0",
+    "id": "00000000-0000-4000-8000-000000000000",
+    "method": "artifactbridge/pool/capability",
+    "params": {
+      "protocolVersion": 2,
+      "executorId": "7b0e3f2a-4c1d-4e8b-9a6f-2d5c8e1b3a90",
+      "executorConnectionRevision": "7",
+      "nonce": "q3VbX9kLm2Rt7YwZp4Hc8NsJd6Fg1Ae5",
+      "requiredCapabilities": [
+        "assignment_tuple_start_ownership",
+        "scoped_space_document_skill",
+        "per_task_credentials_fresh_sessions",
+        "durable_inspect_recovery",
+        "cancel_report_fencing",
+        "cloud_start_headers_v1",
+        "room_space_context_v1"
+      ]
+    }
+  }
+}
