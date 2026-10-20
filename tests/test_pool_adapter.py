@@ -268,6 +268,21 @@ def test_a_changed_stock_send_final_ledgered_refuses_pooled_registration(pool_en
     assert "outside the tested range" in caplog.text
 
 
+def test_a_changed_stock_build_card_refuses_pooled_registration(pool_env, monkeypatch, caplog):
+    from plugins.platforms.a2a.adapter import A2AAdapter
+
+    def changed(self, base_url=None, agent=None):
+        raise AssertionError("never called")
+
+    monkeypatch.setattr(A2AAdapter, "_build_card", changed)
+    assert pool_adapter.hermes_shape_supported() is False
+    ctx, entries = FakeCtx(), []
+    ctx.register_platform = lambda **entry: entries.append(entry)
+    register(ctx)
+    assert entries == [] and [t for t in ctx.tools if t["toolset"] == "artifactbridge-pool"] == []
+    assert "outside the tested range" in caplog.text
+
+
 def test_the_final_reply_reaches_the_stock_ledger_redacted_with_its_keywords_unchanged(listeners, monkeypatch):
     from gateway.platforms.base import BasePlatformAdapter
     seen = []
@@ -327,6 +342,56 @@ def test_the_card_pins_the_registered_listener_url_on_the_jsonrpc_binding(listen
     status, card = listener.call("cloud-card-request.json")
     assert status == 200
     assert [(i["url"], i["protocolBinding"]) for i in card["supportedInterfaces"]] == [(listener.url, "JSONRPC")]
+
+
+MARKER = {"uri": "https://artifactbridge.com/extensions/pool-runtime-protocol/2", "required": False}
+
+
+def stock_card(listener) -> dict:
+    """The card the stock adapter builds for this listener (also what draft #5 and unrepaired #6 served)."""
+    from plugins.platforms.a2a.adapter import A2AAdapter
+    return A2AAdapter._build_card(listener.adapter, listener.url, agent=listener.adapter._agents[""])
+
+
+def test_the_pool_card_is_the_stock_card_plus_exactly_one_optional_protocol_2_marker(listener):
+    stock = stock_card(listener)
+    assert "extensions" not in stock["capabilities"] and stock["security"] == [{"bearer": []}]
+    for _ in range(2):  # a second GET must not accumulate a second marker
+        status, card = listener.call("cloud-card-request.json")
+        assert (status, card) == (200, {**stock, "capabilities": {**stock["capabilities"], "extensions": [MARKER]}})
+
+
+def test_existing_card_extensions_are_kept_ahead_of_the_one_marker(listener, monkeypatch):
+    from plugins.platforms.a2a.adapter import A2AAdapter
+    built, existing = A2AAdapter._build_card, [{"uri": "urn:example:other", "required": True, "params": {"k": 1}}]
+
+    def with_extensions(self, public_url=None, agent=None):
+        card = built(self, public_url, agent)
+        card["capabilities"]["extensions"] = copy.deepcopy(existing)
+        return card
+
+    monkeypatch.setattr(A2AAdapter, "_build_card", with_extensions)
+    status, card = listener.call("cloud-card-request.json")
+    assert status == 200 and card["capabilities"]["extensions"] == [*existing, MARKER]
+    assert {k: v for k, v in card.items() if k != "capabilities"} == {
+        k: v for k, v in stock_card(listener).items() if k != "capabilities"}
+
+
+def test_the_stock_a2a_listener_beside_the_pool_card_carries_no_marker(listener):
+    from plugins.platforms.a2a.adapter import A2AAdapter
+    stock = A2AAdapter(PlatformConfig(enabled=True, extra={"port": 0}))
+    assert listener.run(stock.connect()) is True
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", stock._httpd.server_address[1], timeout=TURN_BOUND)
+        conn.request("GET", "/.well-known/agent-card.json", headers={"authorization": f"Bearer {BEARER}"})
+        response = conn.getresponse()
+        status, body = response.status, json.loads(response.read())
+        conn.close()
+    finally:
+        listener.run(stock.disconnect())
+    assert status == 200 and body["name"] and "extensions" not in body["capabilities"]
+    assert MARKER["uri"] not in json.dumps(body)
+    assert listener.call("cloud-card-request.json")[1]["capabilities"]["extensions"] == [MARKER]
 
 
 def test_the_capability_request_is_answered_from_this_executors_configuration(listener, server):
@@ -402,6 +467,42 @@ def test_a_protocol_2_probe_for_exactly_the_seven_is_answered_with_the_seven(lis
         "protocol-bool"])
 def test_a_protocol_2_probe_other_than_exactly_the_seven_is_refused_capability_mismatch(listener, server, journal_path,
                                                                                          change):
+    status, answer = listener.call("cloud-capability-request.json", body=capability_v2(**change))
+    assert status == 200 and "result" not in answer
+    assert answer["error"] == {**answer["error"], "code": protocol.ERR_INVALID_PARAMS,
+                               "message": "ArtifactBridge pooled dispatch refused: capability_mismatch"}
+    assert server.requests == [] and listener.model.turns == [] and no_tasks(listener) and journaled(journal_path) == []
+
+
+def modeled_selection(card: dict | None) -> int:
+    """MODELED, not the server's code and not a paired proof: the AI-4179 ruling §5 rule. A new server selects 2
+    only when the freshly resolved card's capabilities.extensions holds the exact marker uri, else 1; an old
+    server (``card=None``) never reads extensions and always selects 1."""
+    if card is None:
+        return 1
+    return 2 if MARKER["uri"] in [e.get("uri") for e in card["capabilities"].get("extensions", [])] else 1
+
+
+@pytest.mark.parametrize("pairing", ["old-server/repaired-plugin", "new-server/draft-5-card",
+                                     "new-server/repaired-card"])
+def test_modeled_mixed_version_probes_select_one_version_and_get_that_exact_answer(listener, server, journal_path,
+                                                                                   pairing):
+    card = {"old-server/repaired-plugin": None, "new-server/draft-5-card": stock_card(listener),
+            "new-server/repaired-card": listener.call("cloud-card-request.json")[1]}[pairing]
+    selected = modeled_selection(card)
+    assert selected == (2 if pairing == "new-server/repaired-card" else 1)
+    body = capability_v2() if selected == 2 else fixture("cloud-capability-request.json")["body"]
+    status, answer = listener.call("cloud-capability-request.json", body=body)  # one exchange, no second probe
+    assert status == 200 and answer["result"]["protocolVersion"] == selected
+    assert answer["result"]["capabilities"] == (SEVEN if selected == 2 else SIX)
+    assert server.requests == [] and listener.model.turns == [] and no_tasks(listener) and journaled(journal_path) == []
+
+
+@pytest.mark.parametrize("change", [{"requiredCapabilities": SIX}, {"protocolVersion": 1},
+                                    {"nonce": "N" * 31}], ids=["wrong-set", "wrong-version", "bad-nonce"])
+def test_modeled_a_bad_selected_protocol_2_probe_is_refused_once_with_no_protocol_1_answer(listener, server,
+                                                                                           journal_path, change):
+    assert modeled_selection(listener.call("cloud-card-request.json")[1]) == 2
     status, answer = listener.call("cloud-capability-request.json", body=capability_v2(**change))
     assert status == 200 and "result" not in answer
     assert answer["error"] == {**answer["error"], "code": protocol.ERR_INVALID_PARAMS,
