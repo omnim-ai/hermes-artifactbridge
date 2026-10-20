@@ -241,6 +241,20 @@ server's requests (see Start headers).
   protocol 1. Protocol 2 is unreleased: the server's protocol 2 recording and
   matching are not merged or deployed, and no real paired handshake has been
   proven.
+- **Card marker.** The pooled listener's Agent Card is the stock Hermes card
+  (every stock field, security scheme, interface and skill, and any existing
+  `capabilities.extensions`) plus exactly one appended optional extension,
+  `{"uri": "https://artifactbridge.com/extensions/pool-runtime-protocol/2",
+  "required": false}`. The uri is an opaque identifier, never fetched. It tells
+  a server that reads it that it may send the protocol 2 probe; a server that
+  ignores it keeps probing protocol 1, which this plugin still answers. The
+  marker never stands in for the probe's answer. The stock `a2a` listener's
+  card has no marker. The override is `PoolAdapter._build_card(public_url,
+  agent)`; that stock signature is part of the shape check, so a Hermes whose
+  `_build_card` parameters differ does not register the pooled platform. The
+  tests check this against Hermes 0.22.2 only; they model the server's choice of
+  version from the card (labelled in `tests/test_pool_adapter.py`) and prove
+  nothing about the server's resolver or SDK.
 - **Start headers.** Send, Get, List and Cancel must carry exactly one
   `X-AB-Pool-Protocol-Version: 1`, one `X-AB-Control-Credential: agx_...` and
   one `X-AB-Start-Journal-Id` (printable ASCII, at most 128). Anything missing,
@@ -405,6 +419,9 @@ generated fixture requests, the stock Hermes 0.22.2 A2A adapter and message
 pipeline in-process, a fake control server and a fake MCP boundary; only the
 model is a stand-in. The pooled platform refuses to register on any Hermes
 outside `>=0.22.2,<0.23` or with a different A2A adapter or handler shape.
+Only 0.22.2 has been exercised; a later 0.22 patch registers only if its
+version and the checked member signatures match, and the shape check cannot
+catch a changed behavior behind an unchanged signature.
 
 ## Installation
 

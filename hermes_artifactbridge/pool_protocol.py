@@ -66,6 +66,10 @@ IMPLEMENTED_CAPABILITIES = (
 # version 2 adds the task's room Space root to the six.
 ROOM_SPACE_CONTEXT_CAPABILITY = "room_space_context_v1"
 RUNTIME_PROTOCOL_CAPABILITIES = {1: IMPLEMENTED_CAPABILITIES, 2: (*IMPLEMENTED_CAPABILITIES, ROOM_SPACE_CONTEXT_CAPABILITY)}
+# The pooled Agent Card's optional A2A extension telling a server it may probe protocol 2 (protocol 1 still
+# answers). An opaque identifier, never fetched; the AI-4179 negotiation ruling fixes it.
+RUNTIME_PROTOCOL_2_EXTENSION = {"uri": "https://artifactbridge.com/extensions/pool-runtime-protocol/2",
+                                "required": False}
 _CAPABILITY_KEYS = frozenset({"protocolVersion", "executorId", "executorConnectionRevision", "nonce",
                               "requiredCapabilities"})
 
