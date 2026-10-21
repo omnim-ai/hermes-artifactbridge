@@ -123,3 +123,21 @@ TOOL_NAMES: tuple[str, ...] = tuple(s["name"] for s in TOOL_SCHEMAS)
 # optional delegation_id on Space tools. room_id there selects Room context rather than a Library
 # document; delegation_id defaults server-side to the token's own delegation and any other is refused.
 RESERVED_ARGS = frozenset({"delegation_id", "room_id"})
+
+# Pooled (assignment-bound) variants: same server tool names on the wire, a plugin-side prefix, no token.
+# The per-task dlc_ credential comes from the session binding, never from the model.
+POOL_TOOLSET = "artifactbridge-pool"
+_POOL_PREFIX = "artifactbridge_pool_"
+
+
+def _pooled(schema: dict) -> dict:
+    parameters = dict(schema["parameters"])
+    parameters["properties"] = {k: v for k, v in parameters["properties"].items() if k != TOKEN_ARG}
+    parameters["required"] = [r for r in parameters["required"] if r != TOKEN_ARG]
+    return {"name": _POOL_PREFIX + schema["name"].removeprefix("artifactbridge_"),
+            "description": schema["description"].replace("Pass delegation_token from your task brief verbatim. ", ""),
+            "parameters": parameters}
+
+
+POOL_TOOL_SCHEMAS: tuple[dict, ...] = tuple(_pooled(s) for s in TOOL_SCHEMAS)
+POOL_WIRE_NAMES: dict[str, str] = {p["name"]: s["name"] for p, s in zip(POOL_TOOL_SCHEMAS, TOOL_SCHEMAS)}

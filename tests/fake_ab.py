@@ -61,6 +61,7 @@ class Delegation:
 class FakeAB:
     delegations: dict[str, Delegation] = field(default_factory=dict)
     tokens: dict[str, dict] = field(default_factory=dict)  # plaintext -> row (test-only)
+    pooled_credentials: dict[str, dict] = field(default_factory=dict)  # dlc_ -> {"delegation_id", "expired"?}
     tool_calls: list[tuple[str, dict]] = field(default_factory=list)
     requests: list[dict] = field(default_factory=list)  # every HTTP request: path + which headers were present
     renew_calls: int = 0
@@ -90,6 +91,13 @@ class FakeAB:
         auth = request.headers.get("authorization", "")
         token = request.headers.get(TOKEN_HEADER, "")
         self.requests.append({"path": request.url.path, "authorization": auth, "token": token})
+        if auth.startswith("Bearer dlc_"):  # delegation-authenticated (pooled) mode: no token header
+            pooled = self.pooled_credentials.get(auth.removeprefix("Bearer "))
+            if pooled is None or token:
+                return None, _error("unauthorized", "Unknown pooled credential.", 401)
+            if pooled.get("expired"):
+                return None, _error("credential_expired", "The pooled credential expired.")
+            return {"row": None, "delegation": self.delegations[pooled["delegation_id"]]}, None
         if auth != f"Bearer {SERVICE_CREDENTIAL}":
             return None, _error("unauthorized", "Unknown service credential.", 401)
         row = self.tokens.get(token)

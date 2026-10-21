@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "connection_changed",
+    "message": "The connection changed. Reload and try again."
+  }
+}

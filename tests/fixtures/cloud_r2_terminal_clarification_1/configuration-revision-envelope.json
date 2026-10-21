@@ -1,0 +1,18 @@
+{
+  "protocolVersion": 1,
+  "binding": {
+    "workspaceId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000001",
+    "serviceId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000002",
+    "delegationId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000003",
+    "executionGeneration": 3,
+    "assignmentId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000008",
+    "executorId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000005",
+    "slotId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000006",
+    "reservationGeneration": "3",
+    "executorConnectionRevision": "2"
+  },
+  "dispatchId": "dispatch-3",
+  "commandSequence": 1,
+  "setupRevision": 2,
+  "startBy": "2026-10-17T14:00:00.000Z"
+}

@@ -1,0 +1,17 @@
+{
+  "kind": "withdrawn",
+  "protocolVersion": 1,
+  "binding": {
+    "workspaceId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000001",
+    "serviceId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000002",
+    "delegationId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000003",
+    "executionGeneration": 1,
+    "assignmentId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000004",
+    "executorId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000005",
+    "slotId": "6f1f7d9e-0a1b-4c2d-8e3f-000000000006",
+    "reservationGeneration": "1",
+    "executorConnectionRevision": "1"
+  },
+  "dispatchId": "dispatch-1",
+  "commandSequence": 2
+}

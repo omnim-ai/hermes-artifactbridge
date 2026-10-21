@@ -1,0 +1,9 @@
+{
+  "method": "GET",
+  "url": "https://runner.example.invalid/a2a/.well-known/agent-card.json",
+  "headers": {
+    "a2a-version": "1.0",
+    "authorization": "Bearer RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR"
+  },
+  "body": null
+}

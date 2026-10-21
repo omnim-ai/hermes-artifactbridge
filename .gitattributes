@@ -1,0 +1,2 @@
+# Verbatim copies of ArtifactBridge's U3 fixtures (see SOURCE.md); never whitespace-normalized.
+tests/fixtures/pooled_v1/** -whitespace

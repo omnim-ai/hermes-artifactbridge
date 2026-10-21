@@ -1,0 +1,24 @@
+{
+  "method": "POST",
+  "url": "https://runner.example.invalid/a2a/jsonrpc",
+  "headers": {
+    "a2a-version": "1.0",
+    "accept": "application/json",
+    "authorization": "Bearer RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR",
+    "content-type": "application/json",
+    "x-ab-control-credential": "agx_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "x-ab-pool-protocol-version": "1",
+    "x-ab-start-journal-id": "agj_6f1f7d9e0a1b4c2d8e3f000000000004"
+  },
+  "body": {
+    "jsonrpc": "2.0",
+    "method": "ListTasks",
+    "params": {
+      "contextId": "abc-context-1",
+      "pageSize": 50,
+      "historyLength": 0,
+      "includeArtifacts": true
+    },
+    "id": 3
+  }
+}

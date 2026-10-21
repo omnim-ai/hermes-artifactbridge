@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "capability_probe_required",
+    "message": "Check the connection before joining the pool."
+  }
+}

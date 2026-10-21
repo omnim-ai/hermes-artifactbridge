@@ -1,0 +1,16 @@
+{
+  "protocolVersion": 1,
+  "executorConnectionRevision": "1",
+  "setupRevision": 1,
+  "runtimeVersion": "0.0.0-fixture",
+  "capabilities": [
+    "assignment_tuple_start_ownership",
+    "cancel_report_fencing",
+    "cloud_start_headers_v1",
+    "durable_inspect_recovery",
+    "per_task_credentials_fresh_sessions",
+    "same_session_continuation",
+    "scoped_space_document_skill"
+  ],
+  "verifiedAt": "2026-10-17T11:00:00.000Z"
+}

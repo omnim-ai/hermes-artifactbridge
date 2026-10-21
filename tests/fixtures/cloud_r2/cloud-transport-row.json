@@ -1,0 +1,15 @@
+{
+  "connection_snapshot": {
+    "a2aUrl": "https://runner.example.invalid/a2a/jsonrpc",
+    "remoteAuthRequired": true
+  },
+  "remote_bearer_ciphertext": "SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS",
+  "control_credential_ciphertext": "SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS",
+  "start_journal_id": "agj_6f1f7d9e0a1b4c2d8e3f000000000004",
+  "dispatch_message_id": "dispatch-1",
+  "dispatch_context_id": "abc-context-1",
+  "remote_task_id": "remote-task-1",
+  "state": "running",
+  "current_occupant": true,
+  "control_credential_hash": "f0571dc1ae27ff3038aa88588b47f8973fbe21ee7c373fbf84d8573ac8a68985"
+}
