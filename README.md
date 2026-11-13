@@ -53,7 +53,9 @@ CI runs only the self-contained tests below.
   ambiguous write and never derives a key from content, so intentionally
   repeated operations stay distinct.
 - Ships the namespaced skill `hermes-artifactbridge:delegation`.
-- Registers no Hermes hooks and patches nothing in Hermes.
+- Registers no Hermes hooks and patches nothing in Hermes. A coordinator profile
+  (see [Coordinator profile](#coordinator-profile)) replaces `session_search`
+  for that profile only, through Hermes' operator-granted tool override.
 
 ## HTML Room artifacts and Claude Code handoff
 
@@ -392,6 +394,83 @@ generated fixture requests, the stock Hermes 0.22.2 A2A adapter and message
 pipeline in-process, a fake control server and a fake MCP boundary; only the
 model is a stand-in. The pooled platform refuses to register on any Hermes
 outside `>=0.22.2,<0.23` or with a different A2A adapter or handler shape.
+
+## Coordinator profile
+
+A coordinator is one shared Hermes profile per ArtifactBridge workspace that
+reads its own configured Space. The broker contract is ArtifactBridge's
+coordinator read boundary (artifact-forge `wt/t_8e1ef2b4`, not merged at the
+time of writing). In a profile whose plugin setting `role` is `coordinator`,
+the plugin registers only:
+
+- `artifactbridge_read_space_context` (`cursor`, `include_archived`, `limit`),
+  `artifactbridge_read_document` (`document_id`) and
+  `artifactbridge_read_skill` (`slug`, `version_policy`) in toolset
+  `ab_coordinator_reads`. They take no member, Space, workspace or
+  conversation argument: ArtifactBridge derives all of that from the
+  credential, so every member gets the same reads. Any other argument is
+  refused locally (`unexpected_arguments`) before a request is made. Each call
+  is one MCP request to `/mcp/coordinator-reads` on the origin of
+  `ARTIFACTBRIDGE_TOOLS_URL` (production by default) with only
+  `Authorization: Bearer <ARTIFACTBRIDGE_COORDINATOR_READ_CREDENTIAL>`.
+  Results and refusals come back to that call unchanged. Nothing is cached,
+  retried, renewed or delivered later. Without a `cri_` credential the tools
+  are hidden, and a direct call refuses with `not_configured`.
+- A confined `session_search` (Hermes' `tools.override` capability). It
+  refuses `profile=`, profile-qualified session ids (`<profile>/<id>`), any
+  other malformed session id and any unknown argument. Everything else goes
+  to Hermes' own handler, so the profile can still search, read and scroll its
+  own sessions.
+
+It registers no delegation, pooled or skill surface. Without the
+`tools.override` grant, or with any other `role` value, it registers
+nothing and logs an error. In that case the stock `session_search` stays,
+and it can open other profiles' sessions, so check the grant (step 4).
+
+**This is tool confinement, not a sandbox.** Hermes, the host and other
+in-process plugins can still reach the profile's files. A cancelled tool call
+raises `CancelledError` and returns nothing. However, Hermes' Stop does not
+cancel a running tool handler, and Hermes gives plugins no supported signal
+that the turn was stopped. A read that finishes after Stop is discarded by
+ArtifactBridge, not by the plugin.
+
+Setup:
+
+1. `hermes profile create <name> --no-credentials` (no copied keys, logins or
+   memory). Install the plugin for that profile (see Installation) and merge
+   [`coordinator-profile/config.yaml`](coordinator-profile/config.yaml) into
+   `<HERMES_HOME>/profiles/<name>/config.yaml`. That file selects
+   `platform_toolsets.cli: [memory, session_search, ab_coordinator_reads]`,
+   keeps built-in memory, turns Tool Search off, clears MCP servers, sets
+   `role: coordinator`, grants `tools.override`, and turns off Kanban
+   dispatch, notify and auto-subscribe.
+2. Put the read installation credential that ArtifactBridge shows once into
+   the profile's own `.env`, never into `config.yaml` or chat:
+
+   ```
+   ARTIFACTBRIDGE_COORDINATOR_READ_CREDENTIAL=cri_...
+   ARTIFACTBRIDGE_TOOLS_URL=...      # only for a non-production deployment
+   ```
+3. Two Hermes facts to watch:
+   - A plugin listed in both `plugins.enabled` and `plugins.disabled` does not
+     load, because disable wins.
+   - Other plugins' toolsets are on by default for new sessions unless they
+     are listed in `agent.disabled_toolsets`. Add every toolset another
+     enabled plugin registers to that list.
+4. Check that it took effect, then restart the profile's gateway:
+   - `hermes -p <name> plugins capabilities hermes-artifactbridge` shows
+     `tools.override` granted.
+   - `hermes -p <name> tools list` shows only `memory` and `session_search`
+     enabled, and every plugin toolset disabled.
+   - `hermes -p <name> prompt-size --json` reports `tools.count` 5:
+     `memory`, `session_search` and the three reads.
+   - The gateway log shows `artifactbridge coordinator role: registered
+     confined session_search and ab_coordinator_reads (3 tools)`.
+5. Wake producers: no cron jobs for the profile (`hermes -p <name> cron
+   list`), and no Kanban assignment, dispatch, notification or subscription.
+   The Kanban settings in the bundle apply to a gateway dedicated to
+   coordinators. On a shared multiplexed gateway, do not turn them off for
+   the sibling profiles. Prove instead that nothing wakes the coordinator.
 
 ## Installation
 

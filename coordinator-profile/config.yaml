@@ -1,0 +1,54 @@
+# ArtifactBridge coordinator profile: settings to merge into the coordinator profile's config.yaml
+# (<HERMES_HOME>/profiles/<name>/config.yaml). See README "Coordinator profile".
+# This is tool confinement for a dedicated shared agent, not a sandbox: it does not stop a Hermes
+# operator, a host process or another plugin in the same process from reaching the profile's files.
+
+# Positive selection: the only toolsets a coordinator session gets (dashboard sessions with
+# `source: tool` resolve this CLI policy). Built-in memory, its own session search, and the reads.
+platform_toolsets:
+  cli: [memory, session_search, ab_coordinator_reads]
+
+# Keep the coordinator's own built-in memory (MEMORY.md / USER.md); no external memory provider.
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  provider: ""
+
+# Other plugins' toolsets are on by default for new sessions unless listed here. Add every toolset
+# another enabled plugin registers (see `hermes -p <name> tools --summary`). Keep the delegation and
+# pooled toolsets of this plugin here as well.
+agent:
+  disabled_toolsets:
+    - artifactbridge-delegation
+    - artifactbridge-pool
+
+# Tool Search would add tool_search / tool_describe / tool_call bridges.
+tools:
+  tool_search:
+    enabled: "off"
+
+# No personal MCP servers.
+mcp_servers: {}
+
+plugins:
+  # Only this plugin. A plugin listed in both `enabled` and `disabled` does not load (disable wins):
+  # never list hermes-artifactbridge under `disabled`.
+  enabled:
+    - hermes-artifactbridge
+  entries:
+    hermes-artifactbridge:
+      settings:
+        role: coordinator
+      # Operator approval for the confined session_search override. Without it the plugin registers
+      # nothing and the stock session_search (which can open other profiles' sessions) stays.
+      # `hermes -p <name> plugins enable hermes-artifactbridge` records the same grant interactively.
+      granted_capabilities:
+        - tools.override
+
+# Wake producers. These take effect where the coordinator runs on a gateway dedicated to coordinators.
+# On a shared multiplexed gateway they are gateway-wide: never turn them off for the sibling profiles;
+# instead prove the coordinator gets no Kanban, cron or other wake (README "Coordinator profile").
+kanban:
+  dispatch_in_gateway: false
+  notify_in_gateway: false
+  auto_subscribe_on_create: false

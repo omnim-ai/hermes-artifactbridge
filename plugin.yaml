@@ -29,7 +29,18 @@ provides_tools:
 # the `artifactbridge-pool` platform and the token-free `artifactbridge_pool_*` variants of the eleven tools
 # (toolset `artifactbridge-pool`). They are not listed above because an unconfigured install never registers them.
 # Pooled routes and headers follow artifact-forge a26eb977 (cloud-contract-r2), not merged or deployed (see README).
+# Coordinator profiles (settings.role: coordinator, see README "Coordinator profile") register none of the above:
+# only artifactbridge_read_space_context, artifactbridge_read_document and artifactbridge_read_skill (toolset
+# `ab_coordinator_reads`) and a confined override of Hermes' `session_search`, which needs tools.override.
+capabilities:
+  - tools.override
+config_schema:
+  role: {type: str, choices: [delegation, coordinator], default: delegation, description: "delegation: the delegation tools (default). coordinator: only the coordinator reads and a confined session_search."}
 optional_env:
+  - name: ARTIFACTBRIDGE_COORDINATOR_READ_CREDENTIAL
+    description: "Coordinator profiles only: the coordinator's read installation credential (cri_...), shown once by ArtifactBridge."
+    prompt: "ArtifactBridge coordinator read credential (coordinator profiles only, or empty)"
+    password: true
   - name: ARTIFACTBRIDGE_POOL_ENABLED
     description: "Set to 1 to opt in to pooled (assignment-bound) execution, protocol v1. Off by default: its server routes are not deployed yet (see README)."
     prompt: "Enable ArtifactBridge pooled execution (1 or empty)"
@@ -55,6 +66,6 @@ python_dependencies:
 manifest_version: 2
 license: MIT
 homepage: https://github.com/omnim-ai/hermes-artifactbridge
-tags: [artifactbridge, a2a, delegation]
+tags: [artifactbridge, a2a, delegation, coordinator]
 # Load gate only: exercised against a 0.21.3 source checkout; no released-version validation is claimed.
 requires_hermes: ">=0.21.3"

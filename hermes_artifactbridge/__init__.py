@@ -13,6 +13,8 @@ import os
 from pathlib import Path
 
 from . import pool_adapter
+from .coordinator import (COORDINATOR_TOOL_SCHEMAS, COORDINATOR_TOOLSET, CREDENTIAL_PREFIX, SEARCH_TOOL,
+                          CoordinatorReads, confined_search_handler, confined_search_schema)
 from .endpoint import is_trusted_url
 from .pool_core import CREDENTIALS, POOL_PLATFORM, PoolControl, PoolCore
 from .pool_journal import Journal
@@ -30,6 +32,8 @@ POOL_PORT_ENV = "ARTIFACTBRIDGE_POOL_PORT"
 POOL_REQUIRED_ENV = (POOL_ENABLED_ENV, POOL_EXECUTOR_ID_ENV, POOL_REVISION_ENV)
 SERVICE_CREDENTIAL_ENV = "ARTIFACTBRIDGE_SERVICE_CREDENTIAL"
 TOOLS_URL_ENV = "ARTIFACTBRIDGE_TOOLS_URL"
+COORDINATOR_CREDENTIAL_ENV = "ARTIFACTBRIDGE_COORDINATOR_READ_CREDENTIAL"
+ROLE_SETTING = "role"  # plugins.entries.hermes-artifactbridge.settings.role: delegation (default) | coordinator
 DEFAULT_TOOLS_URL = "https://app.artifactbridge.com/mcp/agent-gateway"
 SKILL_PATH = Path(__file__).resolve().parent.parent / "skills" / "delegation" / "SKILL.md"
 
@@ -139,12 +143,72 @@ def _register_pool(ctx) -> None:
         )
 
 
+def _coordinator_credential() -> str:
+    return _env(COORDINATOR_CREDENTIAL_ENV, "") or ""
+
+
+def _coordinator_configured() -> bool:
+    return _coordinator_credential().startswith(CREDENTIAL_PREFIX) and is_trusted_url(_tools_url())
+
+
+def _stock_session_search():
+    """Hermes' own process-global ``session_search`` entry (public ``tools.registry``), or None."""
+    try:
+        from tools.registry import registry
+    except ImportError:
+        return None
+    entry = registry.snapshot_registration(SEARCH_TOOL)
+    return entry if entry is not None and entry.toolset == SEARCH_TOOL else None
+
+
+def _register_coordinator(ctx) -> None:
+    """Exactly the confined ``session_search`` override and the three reads: no delegation, pool or skill.
+    Without the operator's ``tools.override`` grant, or without Hermes' stock search to confine, nothing
+    registers (the stock search would stay unconfined beside the reads)."""
+    has_capability = getattr(ctx, "has_capability", None)
+    if not (has_capability and has_capability("tools.override")):
+        logger.error("artifactbridge coordinator role needs the tools.override capability to confine "
+                     "session_search; nothing registered")
+        return
+    stock = _stock_session_search()
+    if stock is None:
+        logger.error("artifactbridge coordinator role found no stock session_search to confine; nothing registered")
+        return
+    schema = confined_search_schema(stock.schema)
+    ctx.register_tool(name=SEARCH_TOOL, toolset=stock.toolset, schema=schema,
+                      handler=confined_search_handler(stock.handler), check_fn=stock.check_fn, is_async=False,
+                      description=schema["description"], emoji=stock.emoji, override=True)
+    tools_url = _tools_url()
+    reads = CoordinatorReads(tools_url=tools_url, credential=_coordinator_credential) if is_trusted_url(tools_url) else None
+    for schema in COORDINATOR_TOOL_SCHEMAS:
+        name = schema["name"]
+        ctx.register_tool(
+            name=name, toolset=COORDINATOR_TOOLSET, schema=schema,
+            handler=reads.handler_for(name) if reads else _unconfigured_handler(name),
+            is_async=True, description=schema["description"], check_fn=_coordinator_configured,
+            requires_env=[COORDINATOR_CREDENTIAL_ENV],
+        )
+    logger.info("artifactbridge coordinator role: registered confined %s and %s (%d tools)",
+                SEARCH_TOOL, COORDINATOR_TOOLSET, len(COORDINATOR_TOOL_SCHEMAS))
+
+
 def register(ctx) -> None:
     """Register the eleven static tools unconditionally (the stock ``requires_env``/``check_fn`` gate hides
     them until a credential and trusted tools URL are available) and the skill. With an untrusted override the
     handlers refuse with ``not_configured`` and no client is built. Only when pooled mode is configured, also
-    the ``artifactbridge-pool`` listener and its token-free tools."""
+    the ``artifactbridge-pool`` listener and its token-free tools.
+
+    A profile whose plugin setting ``role`` is ``coordinator`` gets the coordinator surface instead (see
+    ``_register_coordinator``); any other value registers nothing."""
     global PLUGIN
+    get_config = getattr(ctx, "get_config", None)  # absent on Hermes builds without plugin settings
+    role = get_config(ROLE_SETTING, "delegation") if get_config else "delegation"
+    if role == "coordinator":
+        _register_coordinator(ctx)
+        return
+    if role != "delegation":
+        logger.error("artifactbridge: unknown role %r; nothing registered", role)
+        return
     tools_url = _tools_url()
     PLUGIN = build_plugin(tools_url=tools_url) if is_trusted_url(tools_url) else None
     for schema in TOOL_SCHEMAS:
