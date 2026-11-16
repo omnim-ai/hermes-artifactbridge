@@ -178,8 +178,7 @@ class CredentialBindings:
     """In-memory ``dlc_`` per (platform, A2A contextId, A2A task id); a lookup never falls back.
 
     Refresh is serialized per task (``_Bound.lock``): ``lookup`` re-bootstraps a credential within
-    ``_REFRESH_MARGIN`` of its expiresAt, and ``refresh(..., stale)`` re-bootstraps once after a
-    ``credential_expired`` denial of ``stale``. Neither starts a turn; a dropped task's binding stays dropped."""
+    ``_REFRESH_MARGIN`` of its expiresAt. It never starts a run; a dropped task's binding stays dropped."""
 
     def __init__(self, now: Callable[[], datetime] | None = None):
         self._lock = threading.Lock()
@@ -201,13 +200,6 @@ class CredentialBindings:
             return self._renew(key, bound, bound.credential) or (bound.credential if self._now() < bound.expires_at
                                                                   else None)
         return bound.credential
-
-    def refresh(self, platform: str, context_id: str, task_id: str, stale: str) -> str | None:
-        """The credential after one re-bootstrap of ``stale`` (or the one a concurrent refresh already got)."""
-        key = (platform, context_id, task_id)
-        with self._lock:
-            bound = self._bound.get(key)
-        return self._renew(key, bound, stale) if bound else None
 
     def _renew(self, key: tuple[str, str, str], bound: _Bound, stale: str) -> str | None:
         with bound.lock:

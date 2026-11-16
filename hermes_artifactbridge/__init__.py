@@ -13,12 +13,13 @@ import os
 from pathlib import Path
 
 from . import pool_adapter
+from .agent_run import DEFAULT_OMP_RUN, AgentRuns
 from .endpoint import is_trusted_url
-from .pool_core import CREDENTIALS, POOL_PLATFORM, PoolControl, PoolCore
+from .pool_core import POOL_PLATFORM, PoolControl, PoolCore
 from .pool_journal import Journal
 from .pool_protocol import is_bigint_string, is_uuid
-from .schemas import POOL_TOOL_SCHEMAS, POOL_TOOLSET, TOOL_SCHEMAS, TOOLSET
-from .tools import PooledTools, ScopedTools
+from .schemas import TOOL_SCHEMAS, TOOLSET
+from .tools import ScopedTools
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ POOL_ENABLED_ENV = "ARTIFACTBRIDGE_POOL_ENABLED"
 POOL_EXECUTOR_ID_ENV = "ARTIFACTBRIDGE_POOL_EXECUTOR_ID"
 POOL_REVISION_ENV = "ARTIFACTBRIDGE_POOL_CONNECTION_REVISION"
 POOL_PORT_ENV = "ARTIFACTBRIDGE_POOL_PORT"
+OMP_RUN_ENV = "ARTIFACTBRIDGE_OMP_RUN"  # the omp-run binary of pooled agent runs; default `omp-run` on PATH
 POOL_REQUIRED_ENV = (POOL_ENABLED_ENV, POOL_EXECUTOR_ID_ENV, POOL_REVISION_ENV)
 SERVICE_CREDENTIAL_ENV = "ARTIFACTBRIDGE_SERVICE_CREDENTIAL"
 TOOLS_URL_ENV = "ARTIFACTBRIDGE_TOOLS_URL"
@@ -114,7 +116,8 @@ def _pool_adapter_factory(config):
     core = PoolCore(journal=Journal(_journal_path()),
                     control=PoolControl(tools_url=_tools_url()),
                     executor_id=_pool_setting(POOL_EXECUTOR_ID_ENV), connection_revision=_pool_setting(POOL_REVISION_ENV))
-    return pool_adapter.build_adapter_class()(config, core=core, port=_pool_port(config))
+    runs = AgentRuns(tools_url=_tools_url(), binary=_pool_setting(OMP_RUN_ENV) or DEFAULT_OMP_RUN)
+    return pool_adapter.build_adapter_class()(config, core=core, port=_pool_port(config), runs=runs)
 
 
 def _register_pool(ctx) -> None:
@@ -130,20 +133,13 @@ def _register_pool(ctx) -> None:
         install_hint="Set ARTIFACTBRIDGE_POOL_ENABLED=1 and the pooled executor settings",
         allow_update_command=False, platform_hint=_PLATFORM_HINT,
     )
-    pooled = PooledTools(tools_url=_tools_url(), credentials=CREDENTIALS)
-    for schema in POOL_TOOL_SCHEMAS:
-        ctx.register_tool(
-            name=schema["name"], toolset=POOL_TOOLSET, schema=schema, handler=pooled.handler_for(schema["name"]),
-            is_async=True, description=schema["description"], check_fn=_pool_configured,
-            requires_env=list(POOL_REQUIRED_ENV),
-        )
 
 
 def register(ctx) -> None:
     """Register the eleven static tools unconditionally (the stock ``requires_env``/``check_fn`` gate hides
     them until a credential and trusted tools URL are available) and the skill. With an untrusted override the
     handlers refuse with ``not_configured`` and no client is built. Only when pooled mode is configured, also
-    the ``artifactbridge-pool`` listener and its token-free tools."""
+    the ``artifactbridge-pool`` listener."""
     global PLUGIN
     tools_url = _tools_url()
     PLUGIN = build_plugin(tools_url=tools_url) if is_trusted_url(tools_url) else None

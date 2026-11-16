@@ -1,15 +1,17 @@
 """The ``artifactbridge-pool`` listener over real HTTP against the real Hermes stock A2A adapter and the real
 Hermes message pipeline (skipped without Hermes). Requests are the generated
 cloud-contract-r2-terminal-clarification-1 fixtures (tests/fixtures/cloud_r2_terminal_clarification_1), sent
-to the listener's real ``connect()`` socket with the server's headers; only the model (``_message_handler``)
-and the server's control routes (FakeControl) are stand-ins."""
+to the listener's real ``connect()`` socket with the server's headers; only ``omp-run`` (tests/fake_omp_run.py,
+a real subprocess), AB's agent gateway (FakeAB) and the server's control routes (FakeControl) are stand-ins."""
 import asyncio
 import contextlib
 import copy
 import http.client
 import json
+import os
 import sqlite3
 import threading
+import time
 import urllib.parse
 
 import pytest
@@ -22,11 +24,14 @@ from plugins.platforms.a2a import _PLATFORM_HINT, protocol  # noqa: E402
 
 import hermes_artifactbridge as plugin_module  # noqa: E402
 from hermes_artifactbridge import pool_adapter, register  # noqa: E402
+from hermes_artifactbridge.agent_run import AgentRuns  # noqa: E402
 from hermes_artifactbridge.pool_core import POOL_PLATFORM, CredentialBindings, PoolControl, PoolCore  # noqa: E402
 from hermes_artifactbridge.pool_journal import Journal  # noqa: E402
 from hermes_artifactbridge.pool_protocol import report_body  # noqa: E402
-from tests import fake_ab, fake_pool  # noqa: E402
+from hermes_artifactbridge.schemas import TOOL_NAMES  # noqa: E402
+from tests import fake_ab, fake_omp_run, fake_pool  # noqa: E402
 from tests.conftest import FakeCtx  # noqa: E402
+from tests.fake_omp_run import UNIT, FakeOmpRun, completed  # noqa: E402
 from tests.fake_pool import EXECUTOR_ID, REVISION, Clock, FakeControl, envelope, fixture, grant_for  # noqa: E402
 
 POOL_ENV = {"ARTIFACTBRIDGE_POOL_ENABLED": "1", "ARTIFACTBRIDGE_POOL_EXECUTOR_ID": EXECUTOR_ID,
@@ -76,50 +81,54 @@ def server():
     return FakeControl(clock=Clock())
 
 
-class Model:
-    """The stand-in model behind Hermes' real message pipeline. ``behavior`` maps the A2A task id's turn
-    number (0, 1, ...) to ``"block"`` (wait until released or canceled), ``"stubborn"`` (ignore a cancel
-    until released), a reply text (default "done") or a function of the turn's bound dlc_ returning one."""
+class Issued:
+    """FakeAB's pooled credentials: every dlc_ FakeControl minted and has not revoked, for its delegation."""
 
-    def __init__(self, credentials):
-        self.credentials = credentials
-        self.turns, self.seen_credentials, self.behavior = [], [], {}
-        self.started = [threading.Event() for _ in range(4)]
-        self.release = threading.Event()
+    def __init__(self, server):
+        self.server = server
 
-    async def __call__(self, event):
-        n = len(self.turns)
-        self.turns.append(event)
-        self.seen_credentials.append(self.credentials.lookup(event.source.platform.value, event.source.chat_id,
-                                                             event.source.message_id))
-        self.started[n].set()
-        behavior = self.behavior.get(n, "done")
-        if behavior == "block":
-            await asyncio.to_thread(self.release.wait, TURN_BOUND)
-            return "done"
-        if behavior == "stubborn":
-            while not self.release.is_set():
-                try:
-                    await asyncio.to_thread(self.release.wait, TURN_BOUND)
-                except asyncio.CancelledError:
-                    continue
-            return "done after all"
-        return behavior(self.seen_credentials[n]) if callable(behavior) else behavior
+    def get(self, credential):
+        binding = self.server.issued.get(credential)
+        if binding is None or credential in self.server.revoked:
+            return None
+        return {"delegation_id": binding["delegationId"]}
+
+
+@pytest.fixture
+def gateway(server):
+    """AB's agent gateway, answering the dlc_ each bootstrap mints."""
+    ab = fake_ab.FakeAB(pooled_credentials=Issued(server))
+    ab.delegations[BINDING["delegationId"]] = fake_ab.Delegation(id=BINDING["delegationId"])
+    return ab
+
+
+@pytest.fixture
+def omp(tmp_path_factory):
+    return FakeOmpRun(tmp_path_factory.mktemp("omp-run"))  # outside tmp_path: its scenario holds test secrets
 
 
 class Listener:
-    """One listener process: its own journal connection, core, adapter, loop thread and socket."""
+    """One listener process: its own journal connection, core, adapter, loop thread and socket; its runs go to
+    the fake ``omp-run`` and read the brief from FakeAB."""
 
-    def __init__(self, journal_path, server, *, connect=True):
+    def __init__(self, journal_path, server, omp, gateway, *, connect=True):
+        self.omp = omp
         self.credentials = CredentialBindings(now=server.clock)
         self.core = PoolCore(journal=Journal(journal_path),
                              control=PoolControl(tools_url=fake_pool.TOOLS_URL, http_factory=server.factory),
                              executor_id=EXECUTOR_ID, connection_revision=REVISION, credentials=self.credentials,
                              now=server.clock)
+        runs = AgentRuns(tools_url=fake_ab.TOOLS_URL, binary=omp.binary,
+                         http_factory=fake_ab.http_factory(fake_ab.make_app(gateway)))
         self.adapter = pool_adapter.build_adapter_class()(PlatformConfig(enabled=True, extra={}), core=self.core,
-                                                          port=0)
-        self.model = Model(self.credentials)
-        self.adapter.set_message_handler(self.model)
+                                                          port=0, runs=runs)
+        self.local_turns = []  # Hermes' own message pipeline: a pooled task never reaches it
+
+        async def local_turn(event):
+            self.local_turns.append(event)
+            return "a local Hermes turn"
+
+        self.adapter.set_message_handler(local_turn)
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
         self.thread.start()
@@ -158,8 +167,8 @@ class Listener:
         return self.request(request["method"], url, [*pairs, *extra], request["body"] if body is None else body)
 
     def crash(self):
-        """The process dies: the socket closes and the loop stops; no shutdown code runs, so the in-flight
-        turn records nothing."""
+        """The process dies: the socket closes and the loop stops; no shutdown code runs. Its in-flight run's
+        thread stays blocked in ``omp-run wait`` until teardown releases it."""
         httpd, self.adapter._httpd = self.adapter._httpd, None
         httpd.shutdown()
         httpd.server_close()
@@ -167,11 +176,13 @@ class Listener:
         self.thread.join(5)
 
     def stop(self):
-        """Test teardown, also for a crashed listener: release the model, cancel and await every task still
-        on the loop (released, stubborn, canceled or abandoned by the crash), then close the loop."""
+        """Test teardown, also for a crashed listener: release the runs, join their threads, cancel and await
+        every task still on the loop, then close the loop."""
         if self.adapter._httpd is not None:
             self.run(self.adapter.disconnect())
-        self.model.release.set()
+        self.omp.release()
+        for finalizer in list(self.adapter._finalizers.values()):
+            finalizer.join(TURN_BOUND)
         if self.thread.is_alive():
             self.run(self._drain())
             self.loop.call_soon_threadsafe(self.loop.stop)
@@ -195,11 +206,11 @@ def journal_path(tmp_path):
 
 
 @pytest.fixture
-def listeners(registered, server, journal_path):
+def listeners(registered, server, journal_path, omp, gateway):
     started = []
 
     def start(**kwargs):
-        started.append(Listener(journal_path, server, **kwargs))
+        started.append(Listener(journal_path, server, omp, gateway, **kwargs))
         return started[-1]
 
     yield start
@@ -233,8 +244,17 @@ def task_of(answer: dict) -> dict:
     return answer["result"]["task"] if "task" in answer["result"] else answer["result"]
 
 
-def wait_for(event: threading.Event):
-    assert event.wait(TURN_BOUND), "the turn never reached the model"
+def waiting(listener) -> list[str]:
+    """Until the run's ``omp-run wait`` began; returns its argv."""
+    deadline = time.monotonic() + TURN_BOUND
+    while not listener.omp.argvs("wait"):
+        assert time.monotonic() < deadline, "the run never started"
+        time.sleep(0.02)
+    return listener.omp.argvs("wait")[0]
+
+
+def starts(listener) -> list[list[str]]:
+    return listener.omp.argvs("start")
 
 
 def settle(listener, task_id: str):
@@ -253,21 +273,6 @@ def test_this_hermes_is_the_tested_shape_and_an_untested_version_is_refused(monk
     assert pool_adapter.hermes_shape_supported() is False
 
 
-def test_a_changed_stock_send_final_ledgered_refuses_pooled_registration(pool_env, monkeypatch, caplog):
-    from plugins.platforms.a2a.adapter import A2AAdapter
-
-    async def changed(self, event, session_key, text_content, metadata, *, reply_to):
-        raise AssertionError("never called")
-
-    monkeypatch.setattr(A2AAdapter, "send_final_ledgered", changed)
-    assert pool_adapter.hermes_shape_supported() is False
-    ctx, entries = FakeCtx(), []
-    ctx.register_platform = lambda **entry: entries.append(entry)
-    register(ctx)
-    assert entries == [] and [t for t in ctx.tools if t["toolset"] == "artifactbridge-pool"] == []
-    assert "outside the tested range" in caplog.text
-
-
 def test_a_changed_stock_build_card_refuses_pooled_registration(pool_env, monkeypatch, caplog):
     from plugins.platforms.a2a.adapter import A2AAdapter
 
@@ -279,33 +284,13 @@ def test_a_changed_stock_build_card_refuses_pooled_registration(pool_env, monkey
     ctx, entries = FakeCtx(), []
     ctx.register_platform = lambda **entry: entries.append(entry)
     register(ctx)
-    assert entries == [] and [t for t in ctx.tools if t["toolset"] == "artifactbridge-pool"] == []
-    assert "outside the tested range" in caplog.text
+    assert entries == [] and "outside the tested range" in caplog.text
 
 
-def test_the_final_reply_reaches_the_stock_ledger_redacted_with_its_keywords_unchanged(listeners, monkeypatch):
-    from gateway.platforms.base import BasePlatformAdapter
-    seen = []
-
-    async def stock(self, event, session_key, text_content, metadata, *, reply_to, is_ephemeral_response=False):
-        seen.append((event, session_key, text_content, metadata, reply_to, is_ephemeral_response))
-        return "sent", self
-
-    monkeypatch.setattr(BasePlatformAdapter, "send_final_ledgered", stock)
-    listener = listeners(connect=False)
-    event, metadata, dlc = object(), {"notify": True}, "dlc_" + "B" * 43
-    result = listener.run(listener.adapter.send_final_ledgered(event, "session", f"Keys: {AGX} and {dlc}.", metadata,
-                                                               reply_to="task-1", is_ephemeral_response=True))
-    assert result == ("sent", listener.adapter)
-    assert seen == [(event, "session", "Keys: [redacted] and [redacted].", metadata, "task-1", True)]
-
-
-def test_configured_registration_adds_a_separate_listener_and_pooled_tools(registered):
+def test_configured_registration_adds_a_separate_listener_and_no_extra_tools(registered):
     ctx, entries = registered
     assert [(e.name, e.platform_hint, e.allow_update_command) for e in entries] == [(POOL_PLATFORM, _PLATFORM_HINT, False)]
-    pooled = [t for t in ctx.tools if t["toolset"] == "artifactbridge-pool"]
-    assert len(pooled) == 11 and all(t["check_fn"]() for t in pooled)
-    assert len(ctx.tools) == 22 and entries[0].is_connected(None) is True
+    assert [t["name"] for t in ctx.tools] == list(TOOL_NAMES) and entries[0].is_connected(None) is True
 
 
 def test_factory_builds_on_the_pooled_platform_and_port_with_a_journal_under_hermes_home(registered, monkeypatch, tmp_path):
@@ -313,8 +298,11 @@ def test_factory_builds_on_the_pooled_platform_and_port_with_a_journal_under_her
     built = plugin_module._pool_adapter_factory(PlatformConfig(enabled=True, extra={"port": 9912}))
     assert (built.platform.value, built.port, built.name) == (POOL_PLATFORM, 9911, "ArtifactBridge pool")
     assert (tmp_path / "home" / "artifactbridge" / "pool-journal.sqlite3").exists()
+    assert built._runs.binary == "omp-run"  # on PATH unless configured
     monkeypatch.delenv("ARTIFACTBRIDGE_POOL_PORT")
-    assert plugin_module._pool_adapter_factory(PlatformConfig(enabled=True, extra={"port": 9912})).port == 9912
+    monkeypatch.setenv("ARTIFACTBRIDGE_OMP_RUN", "/opt/omp/bin/omp-run")
+    built = plugin_module._pool_adapter_factory(PlatformConfig(enabled=True, extra={"port": 9912}))
+    assert (built.port, built._runs.binary) == (9912, "/opt/omp/bin/omp-run")
 
 
 # ---- bearer, card, capability, method set ----
@@ -335,7 +323,7 @@ def test_the_card_and_every_method_require_the_remote_bearer(listener, server, j
     extra = [("authorization", authorization)] if authorization else []
     status, answer = listener.call(name, drop=("authorization",), extra=extra)
     assert (status, answer["error"]["code"]) == (401, protocol.ERR_UNAUTHORIZED)
-    assert listener.model.turns == [] and server.requests == [] and no_tasks(listener) and journaled(journal_path) == []
+    assert starts(listener) == [] and server.requests == [] and no_tasks(listener) and journaled(journal_path) == []
 
 
 def test_the_card_pins_the_registered_listener_url_on_the_jsonrpc_binding(listener):
@@ -407,7 +395,7 @@ def test_the_capability_request_is_answered_from_this_executors_configuration(li
     assert status == 200 and "result" not in refused
     assert refused["error"] == {**refused["error"], "code": protocol.ERR_INVALID_PARAMS,
                                 "message": "ArtifactBridge pooled dispatch refused: capability_mismatch"}
-    assert server.requests == [] and listener.model.turns == []
+    assert server.requests == [] and starts(listener) == []
 
 
 def test_the_capability_answer_is_none_of_the_shapes_the_servers_verdicts_judge_incompatible(listener):
@@ -441,7 +429,7 @@ def test_a_protocol_2_probe_for_exactly_the_seven_is_answered_with_the_seven(lis
     assert (status, answer) == (200, {"jsonrpc": "2.0", "id": body["id"], "result": {
         "protocolVersion": 2, "executorId": EXECUTOR_ID, "executorConnectionRevision": REVISION,
         "nonce": body["params"]["nonce"], "capabilities": SEVEN, "runtimeVersion": plugin_module.VERSION}})
-    assert server.requests == [] and listener.model.turns == [] and no_tasks(listener) and journaled(journal_path) == []
+    assert server.requests == [] and starts(listener) == [] and no_tasks(listener) and journaled(journal_path) == []
     # Protocol 1 is unchanged: the six, never the seven.
     assert listener.call("cloud-capability-request.json")[1]["result"]["capabilities"] == SIX
 
@@ -471,7 +459,7 @@ def test_a_protocol_2_probe_other_than_exactly_the_seven_is_refused_capability_m
     assert status == 200 and "result" not in answer
     assert answer["error"] == {**answer["error"], "code": protocol.ERR_INVALID_PARAMS,
                                "message": "ArtifactBridge pooled dispatch refused: capability_mismatch"}
-    assert server.requests == [] and listener.model.turns == [] and no_tasks(listener) and journaled(journal_path) == []
+    assert server.requests == [] and starts(listener) == [] and no_tasks(listener) and journaled(journal_path) == []
 
 
 def modeled_selection(card: dict | None) -> int:
@@ -495,7 +483,7 @@ def test_modeled_mixed_version_probes_select_one_version_and_get_that_exact_answ
     status, answer = listener.call("cloud-capability-request.json", body=body)  # one exchange, no second probe
     assert status == 200 and answer["result"]["protocolVersion"] == selected
     assert answer["result"]["capabilities"] == (SEVEN if selected == 2 else SIX)
-    assert server.requests == [] and listener.model.turns == [] and no_tasks(listener) and journaled(journal_path) == []
+    assert server.requests == [] and starts(listener) == [] and no_tasks(listener) and journaled(journal_path) == []
 
 
 @pytest.mark.parametrize("change", [{"requiredCapabilities": SIX}, {"protocolVersion": 1},
@@ -507,7 +495,7 @@ def test_modeled_a_bad_selected_protocol_2_probe_is_refused_once_with_no_protoco
     assert status == 200 and "result" not in answer
     assert answer["error"] == {**answer["error"], "code": protocol.ERR_INVALID_PARAMS,
                                "message": "ArtifactBridge pooled dispatch refused: capability_mismatch"}
-    assert server.requests == [] and listener.model.turns == [] and no_tasks(listener) and journaled(journal_path) == []
+    assert server.requests == [] and starts(listener) == [] and no_tasks(listener) and journaled(journal_path) == []
 
 
 @pytest.mark.parametrize("authorization", [None, "Bearer " + "W" * 43], ids=["absent", "wrong"])
@@ -516,7 +504,7 @@ def test_an_unauthenticated_protocol_2_probe_is_401_before_anything(listener, se
     status, answer = listener.call("cloud-capability-request.json", body=capability_v2(), drop=("authorization",),
                                    extra=extra)
     assert (status, answer["error"]["code"], "result" in answer) == (401, protocol.ERR_UNAUTHORIZED, False)
-    assert server.requests == [] and listener.model.turns == [] and no_tasks(listener) and journaled(journal_path) == []
+    assert server.requests == [] and starts(listener) == [] and no_tasks(listener) and journaled(journal_path) == []
 
 
 @pytest.mark.parametrize("change", [{"executorConnectionRevision": "2"}, {"protocolVersion": 2},
@@ -535,7 +523,7 @@ def test_every_other_method_is_method_not_found_and_never_reaches_the_stock_hand
     body = {**SEND["body"], "method": method, "id": fixture("cloud-capability-error-method-not-found.json")["id"]}
     status, answer = listener.call("cloud-send-request.json", body=body)
     assert (status, answer) == (200, fixture("cloud-capability-error-method-not-found.json"))
-    assert listener.model.turns == [] and server.requests == []
+    assert starts(listener) == [] and server.requests == []
 
 
 # ---- start headers ----
@@ -560,7 +548,7 @@ def test_missing_duplicate_or_malformed_start_headers_are_refused_before_any_tas
     status, answer = listener.call(name, drop=drop, extra=extra)
     assert status == 200 and answer["error"]["code"] == protocol.ERR_INVALID_PARAMS
     assert "invalid_pool_headers" in answer["error"]["message"] and "result" not in answer
-    assert listener.model.turns == [] and server.requests == [] and no_tasks(listener) and journaled(journal_path) == []
+    assert starts(listener) == [] and server.requests == [] and no_tasks(listener) and journaled(journal_path) == []
 
 
 def test_a_grant_for_another_assignment_is_refused_without_a_row_or_a_start(listener, server, journal_path):
@@ -571,7 +559,7 @@ def test_a_grant_for_another_assignment_is_refused_without_a_row_or_a_start(list
     status, answer = listener.call("cloud-send-request.json", headers=headers)
     task = task_of(answer)
     assert (status, task["status"]["state"]) == (200, protocol.STATE_REJECTED) and "journal_mismatch" in json.dumps(task)
-    assert listener.model.turns == [] and server.requests == []
+    assert starts(listener) == [] and server.requests == []
     assert journaled(journal_path) == [] and journaled(journal_path, journal) == []
 
 
@@ -587,13 +575,13 @@ def test_every_send_is_intercepted_before_any_model_invocation(listener, server,
     status, answer = listener.call("cloud-send-request.json", body=body)
     task = task_of(answer)
     assert (status, task["status"]["state"]) == (200, protocol.STATE_REJECTED) and "refused" in json.dumps(task)
-    assert listener.model.turns == [] and listener.adapter._pending == {} and server.requests == []
+    assert starts(listener) == [] and listener.adapter._pending == {} and server.requests == []
 
 
 # ---- Send ----
 
-def test_send_answers_working_with_the_assignment_and_never_waits_for_the_reply(listener, server):
-    listener.model.behavior[0] = "block"
+def test_send_answers_working_with_the_assignment_and_never_waits_for_the_reply(listener, server, gateway):
+    listener.omp.set(wait={"exit": 0, "answer": completed(), "block": True})
     server.issue(envelope())
     status, answer = listener.call("cloud-send-request.json")
     expected = fixture("cloud-send-response.json")
@@ -603,14 +591,15 @@ def test_send_answers_working_with_the_assignment_and_never_waits_for_the_reply(
         k: v for k, v in expected["result"]["task"].items() if k != "id"} | {"status": task["status"]}
     assert task["status"]["state"] == expected["result"]["task"]["status"]["state"] == protocol.STATE_WORKING
     assert task["metadata"] == expected["result"]["task"]["metadata"] and task["contextId"] == CONTEXT
-    event = listener.model.turns[0]
-    assert (event.source.platform.value, event.source.chat_id, event.source.message_id) == (POOL_PLATFORM, CONTEXT,
-                                                                                            task["id"])
-    assert listener.model.seen_credentials[0] in server.issued
+    # The run was started for this agent with the task's own dlc_ (its brief read), and is waited on.
+    start, = starts(listener)
+    assert start[:3] == ["start", "--agent", envelope()["binding"]["serviceId"]]
+    assert waiting(listener) == ["wait", "--unit", UNIT] and listener.local_turns == []
+    assert {r["authorization"].removeprefix("Bearer ") for r in gateway.requests} <= server.issued.keys()
     assert server.starts == [fixture("cloud-start-replay-request.json")]
     assert [r["kind"] for r in server.reports] == ["running"]
 
-    listener.model.release.set()
+    listener.omp.release()
     settle(listener, task["id"])
     status, got = listener.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task["id"]))
     assert got["result"]["status"]["state"] == protocol.STATE_COMPLETED and got["result"]["metadata"] == task["metadata"]
@@ -619,29 +608,25 @@ def test_send_answers_working_with_the_assignment_and_never_waits_for_the_reply(
 
     status, again = listener.call("cloud-send-request.json")  # a lost ack: the same task, never a second turn
     assert (task_of(again)["id"], task_of(again)["status"]["state"]) == (task["id"], protocol.STATE_COMPLETED)
-    assert len(listener.model.turns) == 1 and len(server.starts) == 1
+    assert len(starts(listener)) == 1 and len(server.starts) == 1 and listener.local_turns == []
 
 
-def test_a_send_hermes_has_not_admitted_yet_answers_submitted_never_working(listener, server, monkeypatch):
+def test_a_send_whose_run_has_not_started_yet_answers_submitted_never_working(listener, server, monkeypatch):
     monkeypatch.setattr(pool_adapter, "_ADMISSION_WAIT", 0.2)
-    gate = threading.Event()
-    listener.loop.call_soon_threadsafe(gate.wait, TURN_BOUND)  # the gateway loop is busy: no turn can start
+    listener.omp.set(start={"exit": 0, "answer": fake_omp_run.STARTED, "block": True})  # a slow container start
     server.issue(envelope())
-    try:
-        _, sent = listener.call("cloud-send-request.json")
-    finally:
-        gate.set()
+    _, sent = listener.call("cloud-send-request.json")
     task = task_of(sent)
     assert task["status"]["state"] == protocol.STATE_SUBMITTED and server.reports == []
-    wait_for(listener.model.started[0])
+    listener.omp.release()
     settle(listener, task["id"])
     _, got = listener.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task["id"]))
     assert got["result"]["status"]["state"] == protocol.STATE_COMPLETED
     assert [r["kind"] for r in server.reports] == ["running", "stopped"]
 
 
-def test_concurrent_duplicate_sends_run_one_turn_and_answer_one_task(listener, server):
-    listener.model.behavior[0] = "block"
+def test_concurrent_duplicate_sends_start_one_run_and_answer_one_task(listener, server):
+    listener.omp.set(wait={"exit": 0, "answer": completed(), "block": True})
     server.issue(envelope())
     answers = []
     threads = [threading.Thread(target=lambda: answers.append(listener.call("cloud-send-request.json")))
@@ -650,19 +635,53 @@ def test_concurrent_duplicate_sends_run_one_turn_and_answer_one_task(listener, s
         t.start()
     for t in threads:
         t.join(TURN_BOUND)
-    assert len(listener.model.turns) == 1 and len(server.bootstraps) == 1
+    assert len(starts(listener)) == 1 and len(server.bootstraps) == 1
     assert len({task_of(a)["id"] for _, a in answers}) == 1 and len(answers) == 4
 
 
-@pytest.mark.parametrize("reply, shown", [
-    ("done", "done"),
-    ("[INPUT_REQUIRED] Which tone?", "Which tone?"),
-    (lambda dlc: f"Keys: {AGX} and {dlc}.", "Keys: [redacted] and [redacted]."),  # the turn leaks its own
-    (lambda dlc: f"[INPUT_REQUIRED] Is it {AGX} or {dlc}?", "Is it [redacted] or [redacted]?"),
+ROOM_MESSAGE = "This workspace has no runner credit left this month. Ask a workspace owner to add credit."
+
+
+@pytest.mark.parametrize("start, text", [
+    ({"exit": 2, "answer": {"ok": False, "code": "runner_credential_refused", "status": "credit_exhausted",
+                            "room_message": ROOM_MESSAGE}}, ROOM_MESSAGE),
+    ({"exit": 2, "answer": {"ok": False, "code": "draining", "detail": "the gateway is draining"}}, "draining"),
+    (None, "omp_run_unavailable"),
+], ids=["token-refusal", "start-refusal", "missing-binary"])
+def test_a_run_that_never_started_fails_the_task_with_no_wait_and_no_local_turn(listener, server, start, text):
+    if start is None:
+        os.unlink(listener.omp.binary)
+    else:
+        listener.omp.set(start=start)
+    server.issue(envelope())
+    _, sent = listener.call("cloud-send-request.json")
+    task_id = task_of(sent)["id"]
+    settle(listener, task_id)
+    _, got = listener.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task_id))
+    assert (got["result"]["status"]["state"], _text(got["result"])) == (protocol.STATE_FAILED, text)
+    assert CLOUD_TERMINAL not in got["result"]["metadata"]
+    assert listener.omp.argvs("wait") == [] and listener.local_turns == []
+    assert server.reports == [report_body(BINDING, 1, "stopped", "failed")]  # never running
+    assert listener.credentials.lookup(POOL_PLATFORM, CONTEXT, task_id) is None
+
+
+def asked(question) -> dict:
+    """An ``omp-run wait`` line for a run that ended with a question."""
+    return {**completed(), "outcome": "question", "result_text": None, "question": question}
+
+
+LEAKED_DLC = "dlc_" + "B" * 43
+
+
+@pytest.mark.parametrize("answer, shown", [
+    (completed(), "done"),
+    (asked("Which tone?"), "Which tone?"),
+    (completed(f"Keys: {AGX} and {LEAKED_DLC}."), "Keys: [redacted] and [redacted]."),  # the run echoes credentials
+    (asked(f"Is it {AGX} or {LEAKED_DLC}?"), "Is it [redacted] or [redacted]?"),
 ], ids=["completed", "clarification", "completed-echoing-credentials", "clarification-echoing-credentials"])
-def test_no_secret_reaches_the_model_tasks_journal_logs_or_answers(listener, server, journal_path, tmp_path, caplog,
-                                                                   reply, shown):
-    listener.model.behavior[0] = reply
+def test_no_secret_reaches_the_run_request_tasks_journal_logs_or_answers(listener, server, journal_path, tmp_path,
+                                                                         caplog, answer, shown):
+    listener.omp.set(wait={"exit": 0, "answer": answer})
     server.issue(envelope())
     _, sent = listener.call("cloud-send-request.json")
     task_id = task_of(sent)["id"]
@@ -673,11 +692,11 @@ def test_no_secret_reaches_the_model_tasks_journal_logs_or_answers(listener, ser
         assert _text(task).endswith(shown)
         assert task["metadata"].get(CLOUD_TERMINAL, {}).get("question") in (None, shown)
     answers = [sent, got, listed]
-    blob = (json.dumps(answers) + listener.model.turns[0].text + repr(listener.adapter.tasks.list())
-            + caplog.text).encode()
+    request = listener.omp.calls[0]  # argv and request.json as omp-run read them
+    blob = (json.dumps([answers, request]) + repr(listener.adapter.tasks.list()) + caplog.text).encode()
     blob += b"".join(p.read_bytes() for p in tmp_path.rglob("*") if p.is_file())  # journal, audit, history
     assert [s for s in SECRETS if s in blob] == []
-    assert listener.model.seen_credentials[0].startswith("dlc_")  # the turn held, and could echo, a real dlc_
+    assert request["request"]["brief"]["delegation_id"] == BINDING["delegationId"]  # the brief was read
 
 
 # ---- clarification and continuation ----
@@ -696,11 +715,11 @@ WIDE = "\U0001F600" * 19_999 + "é"  # 20,000 code points: 40,000 UTF-16 units, 
 BINDING = envelope()["binding"]
 
 
-def _asked(listener, server, reply) -> str:
-    """The six-capability handshake, then the fixture Send whose one turn replies ``reply``; returns its task id
+def _asked(listener, server, question) -> str:
+    """The six-capability handshake, then the fixture Send whose run ends asking ``question``; returns its task id
     once its finalizer recorded the outcome."""
     assert "result" in listener.call("cloud-capability-request.json")[1]
-    listener.model.behavior[0] = reply
+    listener.omp.set(wait={"exit": 0, "answer": asked(question)})
     server.issue(envelope())
     _, sent = listener.call("cloud-send-request.json")
     task_id = task_of(sent)["id"]
@@ -712,18 +731,17 @@ def _text(task) -> str:
     return "".join(part["text"] for part in task["status"]["message"]["parts"])
 
 
-@pytest.mark.parametrize("reply, terminal, text, typed", [
-    ("[INPUT_REQUIRED] Which tone?", ASKED, f"{UNCONFIRMED}\n\nWhich tone?", None),
-    (f"[INPUT_REQUIRED] {REGION}", {"reason": "clarification_unsupported", "question": REGION},
+@pytest.mark.parametrize("question, terminal, text, typed", [
+    ("Which tone?", ASKED, f"{UNCONFIRMED}\n\nWhich tone?", None),
+    (REGION, {"reason": "clarification_unsupported", "question": REGION},
      f"{UNCONFIRMED}\n\n{REGION}", "cloud-terminal-clarification-task.json"),
-    ("[input_required] \n ", {"reason": "clarification_unsupported", "question": None}, UNAVAILABLE,
+    (" \n ", {"reason": "clarification_unsupported", "question": None}, UNAVAILABLE,
      "cloud-terminal-clarification-null-question-task.json"),
-    (f"[INPUT_REQUIRED]\n {WIDE} \n", {"reason": "clarification_unsupported", "question": WIDE},
-     f"{UNCONFIRMED}\n\n{WIDE}", None),
-    (f"[INPUT_REQUIRED] {WIDE}x", None, "outcome_too_long", None),  # 20,001: the generic failure, never cut short
+    (f"\n {WIDE} \n", {"reason": "clarification_unsupported", "question": WIDE}, f"{UNCONFIRMED}\n\n{WIDE}", None),
+    (f"{WIDE}x", None, "outcome_too_long", None),  # 20,001: the generic failure, never cut short
 ], ids=["question", "fixture-question", "empty-is-null", "20000-code-points", "20001-is-outcome-too-long"])
 def test_a_clarification_fails_with_its_journaled_cloud_terminal_on_get_list_and_a_resent_send(
-        listener, server, journal_path, monkeypatch, reply, terminal, text, typed):
+        listener, server, journal_path, monkeypatch, question, terminal, text, typed):
     seen, report = [], server._report
 
     def observed(body):  # the stopped report goes out after the journal commit, before the volatile TaskStore
@@ -733,7 +751,7 @@ def test_a_clarification_fails_with_its_journaled_cloud_terminal_on_get_list_and
         return report(body)
 
     monkeypatch.setattr(server, "_report", observed)
-    task_id = _asked(listener, server, reply)
+    task_id = _asked(listener, server, question)
     expected = fixture("cloud-send-response.json")["result"]["task"]["metadata"] | (
         {CLOUD_TERMINAL: terminal} if terminal else {})
     _, got = listener.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task_id))
@@ -755,14 +773,14 @@ def test_a_clarification_fails_with_its_journaled_cloud_terminal_on_get_list_and
     # Content-free reports only, and no Room post by the runner: the server ingests the question with the failure.
     assert server.reports == [report_body(BINDING, 1, "running", None), report_body(BINDING, 2, "stopped", "failed")]
     assert {r["path"] for r in server.requests} == {fake_pool.START_PATH, fake_pool.BOOTSTRAP_PATH, fake_pool.REPORT_PATH}
-    assert len(listener.model.turns) == 1 and listener.credentials.lookup(POOL_PLATFORM, CONTEXT, task_id) is None
+    assert len(starts(listener)) == 1 and listener.credentials.lookup(POOL_PLATFORM, CONTEXT, task_id) is None
 
 
 def test_a_clarification_journaled_before_a_crash_answers_get_and_list_after_restart_by_grant(
         listeners, server, journal_path):
     first = listeners()
     server.faults[fake_pool.REPORT_PATH] = ["down"] * 20  # no report is acknowledged before the crash
-    task_id = _asked(first, server, "[INPUT_REQUIRED] Which tone?")
+    task_id = _asked(first, server, "Which tone?")
     first.crash()
     server.faults[fake_pool.REPORT_PATH].clear()
     try:
@@ -782,15 +800,13 @@ def test_a_clarification_journaled_before_a_crash_answers_get_and_list_after_res
         # The authenticated Get restored the agx_: both journaled reports go out in order, once each.
         assert server.reports == [report_body(BINDING, 1, "running", None),
                                   report_body(BINDING, 2, "stopped", "failed")]
-        assert second.model.turns == [] and len(server.starts) == 1 and len(server.bootstraps) == 1
+        assert len(starts(second)) == 1 and len(server.starts) == 1 and len(server.bootstraps) == 1
     finally:
         first.stop()
 
 
-def test_a_turn_the_runtime_never_answered_reports_timed_out_never_a_confirmed_stop(listener, server,
-                                                                                    monkeypatch):
-    monkeypatch.setenv("A2A_REPLY_TIMEOUT", "1")  # the stock reply wait's floor
-    listener.model.behavior[0] = "block"
+def test_a_run_whose_wait_timed_out_reports_timed_out_never_a_confirmed_stop(listener, server):
+    listener.omp.set(wait={"exit": 1, "answer": {"unit": UNIT, "active": True, "timeout": True}})
     server.issue(envelope())
     _, sent = listener.call("cloud-send-request.json")
     task_id = task_of(sent)["id"]
@@ -810,8 +826,8 @@ def _published(listener, monkeypatch) -> list:
 
 
 def _running(listener, server) -> tuple[str, object]:
-    """A sent task whose turn blocks until released; returns its id and its finalizer thread."""
-    listener.model.behavior[0] = "block"
+    """A sent task whose run's wait blocks until released; returns its id and its finalizer thread."""
+    listener.omp.set(wait={"exit": 0, "answer": completed(), "block": True})
     server.issue(envelope())
     _, sent = listener.call("cloud-send-request.json")
     task_id = task_of(sent)["id"]
@@ -831,7 +847,7 @@ def test_a_result_the_journal_could_not_commit_is_never_published_and_get_answer
     published = _published(listener, monkeypatch)
     task_id, finalizer = _running(listener, server)
     with _journal_fails(journal_path, "NEW.state = 'finished'") as db:  # the result's transaction aborts
-        listener.model.release.set()
+        listener.omp.release()
         finalizer.join(TURN_BOUND)
         db.execute("DROP TRIGGER journal_fails")
     assert published == [] and listener.adapter.tasks.get(task_id)["state"] == protocol.STATE_WORKING
@@ -850,7 +866,7 @@ def test_a_committed_result_whose_report_ack_cannot_be_written_is_still_publishe
     # Only an acknowledgment (a shorter pending list) aborts: the result and its report commit first.
     with _journal_fails(journal_path, "length(coalesce(NEW.pending_reports, '')) < "
                                       "length(coalesce(OLD.pending_reports, '')) AND OLD.state = 'finished'") as db:
-        listener.model.release.set()
+        listener.omp.release()
         finalizer.join(TURN_BOUND)
         db.execute("DROP TRIGGER journal_fails")
     assert published == [(protocol.STATE_COMPLETED, "done")]
@@ -867,10 +883,10 @@ def test_conflicting_duplicate_finalizer_callbacks_publish_only_the_journaled_wi
         listener, server, journal_path, monkeypatch):
     published, finalize = _published(listener, monkeypatch), listener.adapter._finalize_task
     results = [(protocol.STATE_COMPLETED, "done"), (protocol.STATE_COMPLETED, "done"),
-               (protocol.STATE_COMPLETED, "[INPUT_REQUIRED] Which tone?"), (protocol.STATE_FAILED, "boom")]
+               (protocol.STATE_FAILED, f"{UNCONFIRMED}\n\nWhich tone?", ASKED), (protocol.STATE_FAILED, "boom")]
     barrier = threading.Barrier(len(results))
 
-    def duplicated(pending, state, reply):  # the runtime's one answer arrives as identical and conflicting copies
+    def duplicated(pending, state, reply, **outcome):  # one answer arrives as identical and conflicting copies
         def one(result):
             barrier.wait()
             finalize(pending, *result)
@@ -882,7 +898,7 @@ def test_conflicting_duplicate_finalizer_callbacks_publish_only_the_journaled_wi
 
     monkeypatch.setattr(listener.adapter, "_finalize_task", duplicated)
     task_id, finalizer = _running(listener, server)
-    listener.model.release.set()
+    listener.omp.release()
     finalizer.join(TURN_BOUND)
     row, = journaled(journal_path)
     won = ({"completed": protocol.STATE_COMPLETED, "failed": protocol.STATE_FAILED}[row["result_state"]],
@@ -897,7 +913,7 @@ def test_conflicting_duplicate_finalizer_callbacks_publish_only_the_journaled_wi
 
 def test_the_fixture_continuation_after_a_clarification_is_rejected_with_no_turn_session_or_control_call(
         listener, server, journal_path):
-    _asked(listener, server, "[INPUT_REQUIRED] Which tone?")
+    _asked(listener, server, "Which tone?")
     # cloud-continuation-*: historical generation-2 negative inputs, never an allocation or a start capability.
     server.issue(fixture("cloud-continuation-envelope.json"))
     before = len(server.requests)
@@ -909,7 +925,7 @@ def test_the_fixture_continuation_after_a_clarification_is_rejected_with_no_turn
         # Unbound rejection: REJECTED with no assignment metadata (the server accepts FAILED or REJECTED).
         assert task["metadata"][CLOUD_TERMINAL] == (
             fixture("cloud-terminal-continuation-task.json")["result"]["metadata"][CLOUD_TERMINAL])
-    assert len(listener.model.turns) == 1 and server.requests[before:] == []  # no start, bootstrap or report
+    assert len(starts(listener)) == 1 and server.requests[before:] == []  # no start, bootstrap or report
     assert journaled(journal_path, fixture("cloud-continuation-request.json")["headers"]["x-ab-start-journal-id"]) == []
 
 
@@ -927,7 +943,7 @@ def test_a_send_whose_message_id_is_not_the_dispatch_id_gets_no_turn_and_no_cont
     _, answer = listener.call("cloud-send-request.json", body=body)
     task = task_of(answer)
     assert task["status"]["state"] == protocol.STATE_REJECTED and "message_id_mismatch" in json.dumps(task["status"])
-    assert listener.model.turns == [] and server.requests == [] and journaled(journal_path) == []
+    assert starts(listener) == [] and server.requests == [] and journaled(journal_path) == []
 
 
 def test_a_duplicate_send_with_an_altered_message_id_is_refused_without_a_new_turn(listener, server, journal_path):
@@ -940,7 +956,7 @@ def test_a_duplicate_send_with_an_altered_message_id_is_refused_without_a_new_tu
     _, answer = listener.call("cloud-send-request.json", body=body)
     task = task_of(answer)
     assert task["status"]["state"] == protocol.STATE_REJECTED and "message_id_mismatch" in json.dumps(task["status"])
-    assert len(listener.model.turns) == 1 and server.requests[before:] == [] and journaled(journal_path) == rows
+    assert len(starts(listener)) == 1 and server.requests[before:] == [] and journaled(journal_path) == rows
     assert [r["message_id"] for r in rows] == ["dispatch-1"]
 
 
@@ -951,13 +967,13 @@ def test_a_send_whose_start_got_no_answer_keeps_one_task_id_across_retries(liste
     server.issue(envelope())
     _, lost = listener.call("cloud-send-request.json")
     task = task_of(lost)
-    assert task["status"]["state"] == protocol.STATE_FAILED and listener.model.turns == []
+    assert task["status"]["state"] == protocol.STATE_FAILED and starts(listener) == []
     assert task["metadata"] == fixture("cloud-send-response.json")["result"]["task"]["metadata"]
     assert [(r["state"], r["task_id"]) for r in journaled(journal_path)] == [("start_requested", task["id"])]
     _, retried = listener.call("cloud-send-request.json")  # the start now answers: the same task runs
     assert task_of(retried)["id"] == task["id"]
-    wait_for(listener.model.started[0])
-    assert listener.model.turns[0].source.message_id == task["id"]
+    settle(listener, task["id"])
+    assert len(starts(listener)) == 1
 
 
 @pytest.mark.parametrize("framing", ["negative-length", "signed-length", "duplicate-authorization"])
@@ -980,20 +996,21 @@ def test_malformed_framing_is_refused_before_any_read_task_or_journal(listener, 
     finally:
         conn.close()
     assert status == (401 if framing == "duplicate-authorization" else 400)
-    assert listener.model.turns == [] and server.requests == [] and no_tasks(listener) and journaled(journal_path) == []
+    assert starts(listener) == [] and server.requests == [] and no_tasks(listener) and journaled(journal_path) == []
 
 
 # ---- cancel ----
 
-def test_cancel_of_a_running_turn_is_canceled_only_after_the_runtime_stopped_it(listener, server):
-    listener.model.behavior[0] = "block"
+def test_cancel_of_a_running_run_is_canceled_only_after_omp_run_stopped_it(listener, server):
+    listener.omp.set(wait={"exit": 0, "answer": completed(), "block": True})
     server.issue(envelope())
     _, sent = listener.call("cloud-send-request.json")
     task_id = task_of(sent)["id"]
-    wait_for(listener.model.started[0])
+    waiting(listener)
     status, answer = listener.call("cloud-cancel-request.json", body=with_id("cloud-cancel-request.json", task_id))
     task = answer["result"]
     assert (status, task["id"], task["status"]["state"]) == (200, task_id, protocol.STATE_CANCELED)
+    assert listener.omp.argvs("stop") == [["stop", UNIT]]
     assert "artifactbridge.cancel" not in task["metadata"] and task["metadata"] == sent["result"]["task"]["metadata"]
     assert server.reports[-1] == fixture("cancel-ack.json")
     assert listener.credentials.lookup(POOL_PLATFORM, CONTEXT, task_id) is None
@@ -1004,11 +1021,11 @@ def test_cancel_of_a_running_turn_is_canceled_only_after_the_runtime_stopped_it(
 def test_cancel_the_runtime_did_not_confirm_stays_pending_and_the_real_outcome_is_recorded(listener, server,
                                                                                            journal_path, monkeypatch):
     monkeypatch.setattr(pool_adapter, "_CANCEL_CONFIRM_WAIT", 0.5)
-    listener.model.behavior[0] = "stubborn"  # the worker swallows the cancellation and keeps running
+    listener.omp.set(wait={"exit": 0, "answer": completed(), "block": True}, stop={"exit": 1})  # stop failed
     server.issue(envelope())
     _, sent = listener.call("cloud-send-request.json")
     task_id = task_of(sent)["id"]
-    wait_for(listener.model.started[0])
+    waiting(listener)
     for _ in range(2):  # a repeated Cancel manufactures no stop either
         _, answer = listener.call("cloud-cancel-request.json", body=with_id("cloud-cancel-request.json", task_id))
         task = answer["result"]
@@ -1017,7 +1034,7 @@ def test_cancel_the_runtime_did_not_confirm_stays_pending_and_the_real_outcome_i
     assert [r["state"] for r in journaled(journal_path)] == ["running"]
     assert listener.credentials.lookup(POOL_PLATFORM, CONTEXT, task_id) is not None
     assert [r["kind"] for r in server.reports] == ["running"]
-    listener.model.release.set()
+    listener.omp.release()
     settle(listener, task_id)
     _, got = listener.call("cloud-get-task-request.json", body=with_id("cloud-get-task-request.json", task_id))
     assert got["result"]["status"]["state"] == protocol.STATE_COMPLETED
@@ -1036,12 +1053,12 @@ def test_a_finished_task_is_not_cancelable(listener, server):
 
 def test_after_a_restart_get_list_and_cancel_recover_by_grant_and_nothing_respawns(listeners, server, journal_path):
     first = listeners()
-    first.model.behavior[0] = "block"
+    first.omp.set(wait={"exit": 0, "answer": completed(), "block": True})
     server.issue(envelope())
     _, sent = first.call("cloud-send-request.json")
     task_id = task_of(sent)["id"]
-    wait_for(first.model.started[0])
-    first.crash()  # with the turn in flight: its loop stops, its turn records nothing
+    waiting(first)
+    first.crash()  # with the run in flight
     try:
         second = listeners()
         assert [r["state"] for r in journaled(journal_path)] == ["uncertain"]
@@ -1065,7 +1082,7 @@ def test_after_a_restart_get_list_and_cancel_recover_by_grant_and_nothing_respaw
         _, canceled = second.call("cloud-cancel-request.json", body=with_id("cloud-cancel-request.json", task_id))
         assert canceled["error"]["code"] == protocol.ERR_TASK_NOT_CANCELABLE
         _, resent = second.call("cloud-send-request.json")  # an ambiguous Send's replay never respawns
-        assert task_of(resent)["status"]["state"] == protocol.STATE_FAILED and second.model.turns == []
+        assert task_of(resent)["status"]["state"] == protocol.STATE_FAILED and len(starts(second)) == 1
         assert len(server.starts) == 1 and len(server.bootstraps) == 1
-    finally:  # after the assertions: cancel and await the abandoned turn on the crashed loop, then close it
+    finally:  # after the assertions: release the abandoned run, then close the crashed loop
         first.stop()

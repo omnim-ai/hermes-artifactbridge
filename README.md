@@ -194,8 +194,17 @@ ARTIFACTBRIDGE_POOL_ENABLED=1
 ARTIFACTBRIDGE_POOL_EXECUTOR_ID=<executor uuid>
 ARTIFACTBRIDGE_POOL_CONNECTION_REVISION=<revision>
 ARTIFACTBRIDGE_POOL_PORT=9901                       # optional; else platform extra.port, else 9901
+ARTIFACTBRIDGE_OMP_RUN=/path/to/omp-run             # optional; else `omp-run` on PATH
 A2A_BEARER_TOKEN=<remote bearer>                    # or A2A_PEER_TOKENS; required, see below
 ```
+
+**Runtime requirement: `omp-run` on the gateway host.** A pooled task runs as
+an ArtifactBridge agent run in a factory container started by `omp-run start
+--agent` (agent run spec v4), never as a local Hermes turn. The gateway host
+needs ArtifactBridge's `omp-run` (`infra/cloudflare-agent-machine/container/`
+in artifact-forge) on `PATH` or at `ARTIFACTBRIDGE_OMP_RUN`, configured for
+its container runner. Without it every pooled task fails closed with
+`omp_run_unavailable`; there is no fallback to a local turn.
 
 The three settings must be present and well formed (and the tools URL trusted);
 otherwise `register()` registers exactly the legacy surface above. They are read
@@ -281,9 +290,28 @@ server's requests (see Start headers).
   that (platform, contextId, task id) only. `startBy` is checked again after
   bootstrap: if it has passed, the credential is discarded, the dispatch is
   refused `start_deadline_passed` and reported `stopped`/`failed`.
-- **Send answers at once.** Send never waits for the reply. It waits up to 5 s
-  for Hermes to admit the turn and answers `TASK_STATE_WORKING` once admitted
-  (`running` is reported then, not at spawn), else `TASK_STATE_SUBMITTED`. The
+- **Agent run.** With the task's `dlc_` the plugin reads the brief
+  (`artifactbridge_read_room_context`) and the tool list (`tools/list`) from
+  the agent gateway and passes both unchanged into request.json v1: exactly
+  `omp_agent_request` (1), `kind` (`room_task`), `workspace_id`, `agent_id`
+  (the binding's serviceId), `delegation_id`, `execution_generation`,
+  `assignment_id`, `dispatch_id`, `start_by`, `brief`, `tools` and
+  `conversation` (null). The file is owner-only (0600), never logged, and
+  deleted once `omp-run start --agent <serviceId> --request <file>` returns.
+  An `already_running` refusal that names a unit reuses that unit; any other
+  refusal fails the task with its code. A runner-token refusal (exit 2,
+  `runner_credential_refused`) fails the task with the refusal's
+  `room_message` as its text (with none, with the code) and starts nothing.
+  A thread then runs `omp-run
+  wait --unit <unit>`: `completed` completes the task with its `result_text`;
+  `question` fails it as a clarification (below); `failed`, an unknown unit or
+  an unreadable result fails it with the error code; a wait timeout is
+  reported `stopped`/`timed_out`. The model and thinking settings are
+  omp-run's, never passed by the plugin.
+- **Send answers at once.** Send never waits for the result. It waits up to
+  5 s for `omp-run start` to return and answers `TASK_STATE_WORKING` once the
+  run started (`running` is reported then, not at spawn), else
+  `TASK_STATE_SUBMITTED`. The
   task's `metadata["artifactbridge.assignment"]` is the envelope plus
   `startJournalId`, which the server matches tasks by. The A2A task id is
   journaled with the dispatch before the first answer, so a repeated Send for
@@ -296,22 +324,14 @@ server's requests (see Start headers).
 - **Get, List, Cancel.** They read the journal row the start headers name
   (journal id and `agx_` fingerprint) and never create a row or start a turn.
   An unknown or foreign journal is `-32001 task not found` (List: an empty
-  page). Cancel stops the turn through Hermes' own session cancel; the task is
-  `TASK_STATE_CANCELED` (and `cancel_acknowledged` is reported with its own
-  binding) only once the runtime confirmed the stop. Otherwise it stays live
+  page). Cancel runs `omp-run stop <unit>` (a run still starting is stopped as
+  soon as its start returns); the task is `TASK_STATE_CANCELED` (and
+  `cancel_acknowledged` is reported with its own binding) only once the stop
+  exited 0. Otherwise it stays live
   with `metadata["artifactbridge.cancel"] = "pending"` and later records its
   real outcome. A finished task is `-32002 not cancelable`.
-- **Pooled tools.** Toolset `artifactbridge-pool` holds token-free
-  `artifactbridge_pool_*` variants of the eleven tools (same server tools on the
-  wire). They present only the current task's `dlc_` as `Authorization: Bearer`,
-  with no delegation-token header and no service credential. Without a binding
-  they return `pooled_credential_unavailable`. A `dlc_` within 60 s of its
-  `expiresAt` is re-bootstrapped before use, and a `credential_expired` denial
-  is re-bootstrapped and retried exactly once (one refresh per task at a time;
-  a refresh never starts a turn). Legacy tools refuse with
-  `pooled_session_requires_pooled_tools` inside a pooled session.
 - **Clarification.** A pooled runner cannot continue a conversation. When a
-  turn's reply starts with `[INPUT_REQUIRED]`, the task ends
+  run's outcome is `question`, the task ends
   `TASK_STATE_FAILED` with task metadata
   `artifactbridge.cloudTerminal = {"reason": "clarification_unsupported",
   "question": <the trimmed question, or null when empty>}` next to
@@ -321,21 +341,21 @@ server's requests (see Start headers).
   status text says the question's delivery is unconfirmed, quotes the question
   and asks the sender to send the task again as a new request with the answer.
   A question over 20,000 Unicode code points is never cut short: the task
-  fails with the generic `outcome_too_long` and no cloudTerminal. The result
+  fails with the generic `outcome_too_long` and no cloudTerminal. A structured
+  (object) question is its non-empty `prompt` or `question` string; without
+  one it is the object as sorted-key JSON, cut to 20,000 code points. The result
   and its cloudTerminal are journaled with the `stopped`/`failed` report in one
   transaction, before the in-memory task store; the first result wins, and
   Get, List and a repeated Send answer it, also after a restart. Only that
   first result reaches Hermes' task store, A2A history, audit and push; a
   duplicate publishes nothing, and a result the journal could not commit is
   never published (Get and List keep answering the journal's last state). A
-  turn whose reply never arrived (Hermes' `A2A_REPLY_TIMEOUT`) is reported
-  `stopped`/`timed_out`, never a confirmed failure.
-- **Credentials in replies.** Hermes' egress scrub does not know `agx_` or
-  `dlc_` values, so the plugin replaces any `agx_`/`dlc_`-shaped value in a
-  pooled turn's final reply with `[redacted]` before Hermes' delivery ledger
-  records it, and again before the journal, task store, history, audit,
-  answers and the cloudTerminal question. The agent's own session transcript
-  is written by Hermes before the reply reaches the plugin and is not covered.
+  run whose `omp-run wait` timed out is reported `stopped`/`timed_out`, never
+  a confirmed failure.
+- **Credentials in results.** The plugin replaces any `agx_`/`dlc_`-shaped
+  value in a run's result or question with `[redacted]` before the journal,
+  task store, history, audit, answers and the cloudTerminal question. The
+  run's own transcript is omp-run's and is not covered.
 - **Sessions.** Continuations are not supported (native support is tracked as
   AI-4105). Every continuation (a higher execution generation, or another
   assignment of a delegation already journaled) is rejected
@@ -402,9 +422,8 @@ Contract ambiguities, as implemented:
   revokes the earlier `dlc_`.
 - A header refusal is a JSON-RPC error at HTTP 200, and the Agent Card GET
   requires the bearer.
-- The `send` override that resolves only the task named by `reply_to` is
-  tested against the stock adapter over HTTP but not proven in a live gateway
-  turn.
+- After a restart a run still in flight is marked uncertain and reported
+  `crashed`; the plugin does not reattach to its omp-run unit.
 - Pooled requests do not increment the stock A2A `inbound_total` or
   `anti_loop_triggers` metrics: rebinding a Hermes module attribute fails
   `hermes plugins validate`. Validation passes, but it warns about private core
@@ -415,9 +434,10 @@ Contract ambiguities, as implemented:
 
 **Not proven.** No pooled journey has run against a real ArtifactBridge server
 or a live Hermes gateway. The tests drive the listener's real socket with the
-generated fixture requests, the stock Hermes 0.22.2 A2A adapter and message
-pipeline in-process, a fake control server and a fake MCP boundary; only the
-model is a stand-in. The pooled platform refuses to register on any Hermes
+generated fixture requests and the stock Hermes 0.22.2 A2A adapter
+in-process, against a fake control server, a fake MCP boundary and a fake
+`omp-run` executable (`tests/fake_omp_run.py`); no real `omp-run` or factory
+container has run a pooled task. The pooled platform refuses to register on any Hermes
 outside `>=0.22.2,<0.23` or with a different A2A adapter or handler shape.
 Only 0.22.2 has been exercised; a later 0.22 patch registers only if its
 version and the checked member signatures match, and the shape check cannot
@@ -513,7 +533,7 @@ refusals as contract fixtures; they prove forwarding, header handling, renewal
 and exact result passthrough, not backend ACL or SQL behavior.
 Local checks used Python 3.14.7, mcp 2.2.0 and httpx2 2.13.1.
 
-Pooled-mode core tests (`tests/test_pool_core.py`, `tests/test_pool_tools.py`)
+Pooled-mode core tests (`tests/test_pool_core.py`, `tests/test_agent_run.py`)
 use a fake control server (`tests/fake_pool.py`) and run without Hermes. The
 adapter tests (`tests/test_pool_adapter.py`) skip unless Hermes' stock A2A
 adapter is importable; run them from a scratch venv on Hermes' Python whose

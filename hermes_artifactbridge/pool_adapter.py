@@ -2,10 +2,11 @@
 
 Its own request handler requires the remote bearer on every request (card included), serves only the
 pooled JSON-RPC methods (SendMessage, GetTask, ListTasks, CancelTask and ``artifactbridge/pool/capability``)
-and checks the start headers before anything else. Every Send goes through ``PoolCore.admit`` before any
-MessageEvent exists; any refusal ends the A2A task immediately and the model is never invoked (no stock
-fallthrough). Get/List/Cancel project the durable journal and never create a row or start a turn. The stock
-``a2a`` platform is untouched. Hermes is imported lazily inside ``build_adapter_class`` so the plugin
+and checks the start headers before anything else. Every Send goes through ``PoolCore.admit`` before anything
+runs; any refusal ends the A2A task immediately and nothing is started (no stock fallthrough). A permitted task
+runs as an ArtifactBridge agent run in a factory container (``agent_run.AgentRuns``: ``omp-run start --agent``),
+never as a local Hermes turn. Get/List/Cancel project the durable journal and never create a row or start a run.
+The stock ``a2a`` platform is untouched. Hermes is imported lazily inside ``build_adapter_class`` so the plugin
 imports without Hermes, and ``hermes_shape_supported`` refuses registration on an untested Hermes.
 """
 from __future__ import annotations
@@ -17,33 +18,29 @@ import logging
 import threading
 import time
 
-from .pool_core import CANCELED, COMPLETED, FAILED, POOL_PLATFORM, REJECTED, Decision, clarification, refusal_text
+from .agent_run import AgentRuns, Outcome
+from .pool_core import CANCELED, COMPLETED, FAILED, POOL_PLATFORM, REJECTED, Decision, refusal_text
 from .pool_protocol import (CAPABILITY_METHOD, METADATA_KEY, RUNTIME_PROTOCOL_2_EXTENSION, TERMINAL_KEY, Refused,
-                            capability_answer, pool_grant, redact_credentials)
+                            capability_answer, envelope_from_metadata, pool_grant, redact_credentials)
 
 logger = logging.getLogger(__name__)
 
 TESTED_HERMES = ">=0.22.2,<0.23"
 DEFAULT_PORT = 9901
-# A Send waits this long for Hermes to admit the spawned turn; a turn not yet admitted answers Submitted.
+# A Send waits this long for omp-run to start the run; a run not yet started answers Submitted.
 _ADMISSION_WAIT = 5.0
-# A CancelTask waits this long (after Hermes' own bounded session cancel) for the stop to be recorded.
+# A CancelTask waits this long (after ``omp-run stop``) for the stop to be recorded.
 _CANCEL_CONFIRM_WAIT = 10.0
-# The stock A2AAdapter / BasePlatformAdapter members this shim overrides or calls, with the parameters it
-# relies on, and the stock request handler members PoolRequestHandler reuses.
+# The stock A2AAdapter members this shim overrides or calls, with the parameters it relies on, and the stock
+# request handler members PoolRequestHandler reuses.
 _STOCK_SHAPE = {
     "_end_task": ["self", "rec", "state", "text", "stored_reply"],
-    "_finalize_task": ["self", "pending", "state", "reply"], "_await_reply": ["self", "pending", "keepalive"],
+    "_finalize_task": ["self", "pending", "state", "reply"],
     "_record_outcome": ["self", "task_id", "context_id", "peer", "state", "reply", "started"],
-    "send": ["self", "chat_id", "content", "reply_to", "metadata"], "connect": ["self", "_kwargs"],
-    "_add_pending": ["self", "task_id", "context_id"], "_pop_pending": ["self", "task_id"],
-    "_resolve_task": ["self", "task_id", "state", "text"], "_route_for_request": ["self", "raw_path", "params"],
+    "connect": ["self", "_kwargs"],
+    "_route_for_request": ["self", "raw_path", "params"],
     "_register_inline_push": ["self", "task_id", "params", "agent"], "_scope_for_agent": ["self", "agent"],
-    "on_processing_start": ["self", "event"], "_event_session_key": ["self", "event"],
-    "cancel_session_processing": ["self", "session_key", "release_guard", "discard_pending"],
     "_set_fatal_error": ["self", "code", "message", "retryable"], "_build_card": ["self", "public_url", "agent"],
-    "send_final_ledgered": ["self", "event", "session_key", "text_content", "metadata", "reply_to",
-                            "is_ephemeral_response"],
 }
 _HANDLER_SHAPE = {"_json": ["self", "code", "payload"], "_error": ["self", "http_code", "req_id", "code", "message"],
                   "_client_ip": ["self"], "do_GET": ["self"]}
@@ -61,7 +58,6 @@ def hermes_shape_supported() -> bool:
                     for name, params in _STOCK_SHAPE.items())
                 and all(list(inspect.signature(getattr(A2ARequestHandler, name)).parameters) == params
                         for name, params in _HANDLER_SHAPE.items())
-                and "message_id" in inspect.signature(A2AAdapter.build_source).parameters
                 and all(callable(getattr(TaskStore, m, None)) for m in ("create", "get", "complete", "set_state")))
     except Exception:
         return False
@@ -69,8 +65,6 @@ def hermes_shape_supported() -> bool:
 
 def build_adapter_class():
     from gateway.config import Platform
-    from gateway.platforms.base import SendResult
-    from gateway.platforms.event import MessageEvent, MessageType
     from plugins.platforms.a2a import protocol, security
     from plugins.platforms.a2a.adapter import _MAX_BODY, A2AAdapter, A2ARequestHandler, _err, _ok
 
@@ -140,14 +134,15 @@ def build_adapter_class():
             self._json(200, getattr(adapter, handler_name)(req_id, params, identity, grant))
 
     class PoolAdapter(A2AAdapter):
-        def __init__(self, config, *, core, port: int):
+        def __init__(self, config, *, core, port: int, runs: AgentRuns):
             super().__init__(config)
             self.platform = Platform(POOL_PLATFORM)
             self.port = port
             self._core = core
-            self._events: dict[str, object] = {}  # A2A task id -> its MessageEvent, for a session cancel
-            self._admitted: dict[str, threading.Event] = {}  # set once Hermes admitted the task's turn
-            self._finalizers: dict[str, threading.Thread] = {}  # waits on the task's reply, records its outcome
+            self._runs = runs
+            self._units: dict[str, str] = {}  # A2A task id -> its started omp-run unit, for a stop
+            self._admitted: dict[str, threading.Event] = {}  # set once the task's start returned
+            self._finalizers: dict[str, threading.Thread] = {}  # starts and waits on the run, records its outcome
             self._cancel_requested: set[str] = set()
 
         @property
@@ -212,8 +207,9 @@ def build_adapter_class():
                                 "totalSize": len(tasks)})
 
         def _pool_cancel(self, req_id, params, peer, grant):
-            """Canceled only on a confirmed stop of this task's own turn; otherwise the task stays live with
-            ``artifactbridge.cancel: pending`` and keeps its occupancy."""
+            """Canceled only on a confirmed ``omp-run stop`` of this task's own run; otherwise the task stays live
+            with ``artifactbridge.cancel: pending`` and keeps its occupancy. A run still starting is stopped as
+            soon as its start returns."""
             task_id = str(params.get("id") or "")
             row = self._core.recovery_row(grant)
             if row is None or row["task_id"] != task_id:
@@ -221,18 +217,13 @@ def build_adapter_class():
             view = self._core.projection(row)
             if view.kind == "terminal" and view.outcome != CANCELED:
                 return _err(req_id, protocol.ERR_TASK_NOT_CANCELABLE, f"task {task_id} already {a2a_state[view.outcome]}")
-            event = self._events.get(task_id)
-            if view.kind == "working" and event is not None and self._loop is not None:
+            finalizer = self._finalizers.get(task_id)
+            if view.kind != "terminal" and finalizer is not None:
                 self._cancel_requested.add(task_id)
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        self.cancel_session_processing(self._event_session_key(event)), self._loop
-                    ).result(_CANCEL_CONFIRM_WAIT)
-                except Exception as exc:
-                    logger.warning("artifactbridge pooled cancel did not complete: %s", type(exc).__name__)
-                finalizer = self._finalizers.get(task_id)
-                if finalizer is not None:  # a confirmed stop resolves the future; its finalizer records it
-                    finalizer.join(_CANCEL_CONFIRM_WAIT)
+                unit = self._units.get(task_id)
+                if unit is not None and not self._runs.stop(unit):
+                    logger.warning("artifactbridge pooled cancel: omp-run stop did not confirm")
+                finalizer.join(_CANCEL_CONFIRM_WAIT)  # a confirmed stop ends the wait; the finalizer records it
                 row = self._core.recovery_row(grant) or row
             task = self._project(row)
             if task["status"]["state"] != protocol.STATE_CANCELED:
@@ -290,66 +281,64 @@ def build_adapter_class():
             return task
 
         def _dispatch(self, params, peer, context_id, task_id) -> None:
-            """The stock local dispatch (anti-loop, framing, audit, persistence, push) under the permitted ids.
-            The task is Submitted until Hermes admits the turn (``on_processing_start``); this waits up to
-            ``_ADMISSION_WAIT`` for that, and a finalizer thread records the outcome."""
+            """The stock bookkeeping (anti-loop, audit, persistence, push) under the permitted ids, then the task's
+            thread starts its agent run (``omp-run start --agent``) and waits on it; never a local Hermes turn. The
+            task is Submitted until the start returned; this waits up to ``_ADMISSION_WAIT`` for that."""
             text = protocol.extract_text(params)
             rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(None))
             turn, max_turns = self._turns.track(context_id), protocol.max_pingpong_turns()
             if turn > max_turns:  # no stock metric increments: rebinding a Hermes module attribute fails validate
                 return self._fail(rec, f"Anti-loop protection: context {context_id} exceeded {max_turns} turns.")
-            if self._loop is None or self._message_handler is None:
-                return self._fail(rec, "Agent gateway not ready to accept A2A tasks.")
-            framed = security.wrap_inbound(peer, text)
             security.audit("inbound", peer, task_id, text)
             protocol.persist_message(context_id, "user", text, task_id)
             self._register_inline_push(task_id, params, agent=None)
-            fut = self._add_pending(task_id, context_id)
-            event = MessageEvent(text=framed, message_type=MessageType.TEXT, message_id=task_id,
-                                 source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm",
-                                                          user_id=peer, user_name=peer, message_id=task_id))
+            pending = {"task_id": task_id, "context_id": context_id, "peer": peer, "created_iso": rec["created_iso"],
+                       "started": time.time()}
+            envelope = envelope_from_metadata(params.get("metadata"))  # admit journaled exactly this envelope
             admitted = self._admitted[task_id] = threading.Event()
-            self._events[task_id] = event
-            try:
-                asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
-            except Exception as e:
-                self._pop_pending(task_id)
-                return self._fail(rec, security.redact_outbound(f"Dispatch failed: {e}"))
-            pending = {"task_id": task_id, "context_id": context_id, "peer": peer, "future": fut,
-                       "created_iso": rec["created_iso"], "started": time.time()}
             finalizer = self._finalizers[task_id] = threading.Thread(
-                target=lambda: self._finalize_task(pending, *self._await_reply(pending)),
-                name=f"artifactbridge-pool-{task_id}", daemon=True)
+                target=self._run_agent, args=(pending, envelope), name=f"artifactbridge-pool-{task_id}", daemon=True)
             finalizer.start()
             admitted.wait(_ADMISSION_WAIT)
+
+        def _run_agent(self, pending, envelope) -> None:
+            """Start the run (Working once started), stop it at once if a cancel came first, wait on it, record it."""
+            task_id, context_id = pending["task_id"], pending["context_id"]
+            try:
+                credential = self._core.credentials.lookup(POOL_PLATFORM, context_id, task_id)
+                result = (self._runs.start(envelope, credential) if credential
+                          else Outcome(FAILED, "pooled_credential_unavailable"))
+                if isinstance(result, str):
+                    self._units[task_id] = result
+                    if self._core.started(task_id):
+                        self.tasks.set_state(task_id, protocol.STATE_WORKING)
+                    self._admitted[task_id].set()
+                    if task_id in self._cancel_requested:
+                        self._runs.stop(result)
+                    result = self._runs.wait(result)
+            except Exception as exc:  # fail closed: the task ends, never a local turn
+                logger.warning("artifactbridge agent run failed: %s", type(exc).__name__)
+                result = Outcome(FAILED, "agent_run_failed")
+            self._admitted[task_id].set()
+            self._finalize_task(pending, a2a_state[result.state], result.text, terminal=result.terminal,
+                                timed_out=result.timed_out)
 
         def _fail(self, rec, text: str) -> None:
             self._core.finish(rec["task_id"], FAILED, text)
             self._end_task(rec, protocol.STATE_FAILED, text, stored_reply=text)
 
-        async def on_processing_start(self, event) -> None:
-            task_id = str(getattr(event, "message_id", "") or "")
-            if await asyncio.to_thread(self._core.started, task_id):
-                self.tasks.set_state(task_id, protocol.STATE_WORKING)
-            admitted = self._admitted.get(task_id)
-            if admitted is not None:
-                admitted.set()
-            await super().on_processing_start(event)
-
-        def _finalize_task(self, pending, state, reply):
+        def _finalize_task(self, pending, state, reply, terminal=None, timed_out=False):
             """The journal first: the row's result, cloudTerminal and report commit in one transaction before
             the stock finalizer's volatile TaskStore, persistence, audit and push, so Get/List after a crash or
-            a lost response answer from the journal. Only the callback whose result the journal committed (the
+            a lost response answer from the journal. Only the call whose result the journal committed (the
             first) reaches the stock finalizer; a duplicate, or a result the journal could not commit, publishes
             nothing. A clarification cannot be continued (AI-4105): the task fails with
-            ``artifactbridge.cloudTerminal`` and the server, not this runner, posts the question."""
+            ``artifactbridge.cloudTerminal`` and the server, not this runner, posts the question. ``timed_out``:
+            the run's stop is unknown, so the report says timed_out."""
             task_id = pending["task_id"]
-            timed_out = not pending["future"].done()  # the stock wait gave up: the turn's stop is unknown
             reply = redact_credentials(security.redact_outbound(reply or ""))
-            stripped, terminal = reply.lstrip(), None
-            if state == protocol.STATE_COMPLETED and stripped.upper().startswith(protocol.INPUT_REQUIRED_MARKER):
-                state = protocol.STATE_FAILED
-                reply, terminal = clarification(stripped[len(protocol.INPUT_REQUIRED_MARKER):])
+            if terminal and terminal.get("question"):  # the run's question: scrubbed as the reply is
+                terminal = {**terminal, "question": redact_credentials(security.redact_outbound(terminal["question"]))}
             try:  # only this task's own row; a replaced row is left untouched and unreported
                 if state == protocol.STATE_CANCELED and task_id in self._cancel_requested:
                     committed = self._core.cancel(task_id)
@@ -364,25 +353,9 @@ def build_adapter_class():
                 if committed:
                     state, reply = super()._finalize_task(pending, state, reply)
             finally:
-                self._pop_pending(task_id)
                 self._cancel_requested.discard(task_id)
-                for live in (self._events, self._admitted, self._finalizers):
+                for live in (self._units, self._admitted, self._finalizers):
                     live.pop(task_id, None)
             return state, reply
-
-        async def send_final_ledgered(self, event, session_key, text_content, metadata, **kwargs):
-            """A pooled turn's final reply, before the stock delivery ledger (state.db) records it: no
-            agx_/dlc_-shaped value, which Hermes' own scrub does not know."""
-            return await super().send_final_ledgered(event, session_key, redact_credentials(text_content), metadata,
-                                                     **kwargs)
-
-        async def send(self, chat_id, content, reply_to=None, metadata=None):
-            """The final reply resolves exactly the task it answers (``reply_to`` is the A2A task id), so a
-            canceled turn's late reply never completes a newer task queued on the same context."""
-            rec = self.tasks.get(str(reply_to or ""))
-            if (metadata or {}).get("notify") and rec and rec["context_id"] == chat_id:
-                self._resolve_task(rec["task_id"], protocol.STATE_COMPLETED, content or "")
-                return SendResult(success=True, message_id=str(int(time.time() * 1000)))
-            return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
 
     return PoolAdapter

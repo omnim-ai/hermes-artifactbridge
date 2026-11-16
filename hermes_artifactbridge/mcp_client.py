@@ -10,13 +10,16 @@ process-wide header is ever swapped. Both requests carry the same two headers:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from typing import Any, Callable
 
 import httpx2
+from mcp import types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
+from pydantic import TypeAdapter
 
 TOKEN_HEADER = "x-artifactbridge-delegation-token"
 HttpFactory = Callable[[dict[str, str]], httpx2.AsyncClient]
@@ -89,23 +92,30 @@ def adapt_result(result: Any) -> dict:
     return {"error": "scoped_call_failed", "content": blocks} if is_error else {"content": blocks}
 
 
+@contextlib.asynccontextmanager
+async def _scoped_session(tools_url: str, headers: dict[str, str], http_factory: HttpFactory):
+    """One initialized MCP session on ``tools_url`` with ``headers``; a 401/403 raises ``BoundaryRefused``
+    (inside the transport's exception group)."""
+    http = http_factory(headers)
+    hooks = http.event_hooks
+    hooks.setdefault("response", []).append(_raise_on_boundary_denial)
+    http.event_hooks = hooks
+    async with http:
+        async with streamable_http_client(tools_url, http_client=http) as streams:
+            async with ClientSession(streams[0], streams[1]) as session:
+                await session.initialize()
+                yield session
+
+
 async def call_scoped_tool(
     tools_url: str, headers: dict[str, str], name: str, arguments: dict, *,
     http_factory: HttpFactory = default_http_factory, timeout: float = 300, preserve: bool = False,
 ) -> dict:
     """``preserve`` returns AB's MCP result as ``{"content", "isError"}`` unchanged and a JSON-RPC
     error (e.g. tool not offered) as ``{"error": {"code", "message"}}`` instead of raising."""
-    http = http_factory(headers)
-    hooks = http.event_hooks
-    hooks.setdefault("response", []).append(_raise_on_boundary_denial)
-    http.event_hooks = hooks
     try:
-        async with http:
-            async with streamable_http_client(tools_url, http_client=http) as streams:
-                read_stream, write_stream = streams[0], streams[1]
-                async with ClientSession(read_stream, write_stream) as session:
-                    await session.initialize()
-                    result = await session.call_tool(name, arguments, read_timeout_seconds=timeout)
+        async with _scoped_session(tools_url, headers, http_factory) as session:
+            result = await session.call_tool(name, arguments, read_timeout_seconds=timeout)
     except BaseException as exc:  # the mcp transport wraps failures in exception groups
         refused = _find(exc, BoundaryRefused)
         if refused is not None:
@@ -123,6 +133,30 @@ async def call_scoped_tool(
         wire = result.model_dump(mode="json", by_alias=True, exclude_none=True)
         return {"content": wire.get("content", []), "isError": bool(wire.get("isError", False))}
     return adapt_result(result)
+
+
+_RAW_RESULT = TypeAdapter(dict[str, Any])
+
+
+async def list_scoped_tools(tools_url: str, headers: dict[str, str], *,
+                            http_factory: HttpFactory = default_http_factory) -> list[dict]:
+    """AB's ``tools/list``, every page, each tool object exactly as the server sent it (the SDK's tool model would
+    drop keys it does not know). Any failure, a boundary denial included, raises."""
+    tools: list[dict] = []
+    cursor = None
+    try:
+        async with _scoped_session(tools_url, headers, http_factory) as session:
+            while True:
+                params = types.PaginatedRequestParams(cursor=cursor) if cursor else None
+                page = await session.send_request(types.ListToolsRequest(params=params), _RAW_RESULT)
+                if not (isinstance(page.get("tools"), list) and all(isinstance(t, dict) for t in page["tools"])):
+                    raise ValueError("malformed tools/list result")
+                tools += page["tools"]
+                cursor = page.get("nextCursor")
+                if not cursor:
+                    return tools
+    finally:
+        await asyncio.sleep(0)  # the transport's finalizer tick, as in call_scoped_tool
 
 
 async def renew_delegation_token(

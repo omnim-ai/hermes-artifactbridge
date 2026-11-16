@@ -26,8 +26,8 @@ provides_tools:
   - artifactbridge_read_space_context
   - artifactbridge_read_skill
 # Pooled mode only (ARTIFACTBRIDGE_POOL_ENABLED=1 and the executor settings below): the plugin also registers
-# the `artifactbridge-pool` platform and the token-free `artifactbridge_pool_*` variants of the eleven tools
-# (toolset `artifactbridge-pool`). They are not listed above because an unconfigured install never registers them.
+# the `artifactbridge-pool` platform; it registers no extra tools. It is not listed above because an unconfigured
+# install never registers it.
 # Pooled routes and headers follow artifact-forge a26eb977 (cloud-contract-r2), not merged or deployed (see README).
 optional_env:
   - name: ARTIFACTBRIDGE_POOL_ENABLED
