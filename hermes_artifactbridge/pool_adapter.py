@@ -18,8 +18,8 @@ import threading
 import time
 
 from .pool_core import CANCELED, COMPLETED, FAILED, POOL_PLATFORM, REJECTED, Decision, clarification, refusal_text
-from .pool_protocol import (CAPABILITY_METHOD, METADATA_KEY, TERMINAL_KEY, Refused, capability_answer, pool_grant,
-                            redact_credentials)
+from .pool_protocol import (CAPABILITY_METHOD, METADATA_KEY, RUNTIME_PROTOCOL_2_EXTENSION, TERMINAL_KEY, Refused,
+                            capability_answer, pool_grant, redact_credentials)
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ _STOCK_SHAPE = {
     "_register_inline_push": ["self", "task_id", "params", "agent"], "_scope_for_agent": ["self", "agent"],
     "on_processing_start": ["self", "event"], "_event_session_key": ["self", "event"],
     "cancel_session_processing": ["self", "session_key", "release_guard", "discard_pending"],
-    "_set_fatal_error": ["self", "code", "message", "retryable"],
+    "_set_fatal_error": ["self", "code", "message", "retryable"], "_build_card": ["self", "public_url", "agent"],
     "send_final_ledgered": ["self", "event", "session_key", "text_content", "metadata", "reply_to",
                             "is_ephemeral_response"],
 }
@@ -174,6 +174,14 @@ def build_adapter_class():
                 return False
             await asyncio.to_thread(self._core.recover)  # turns lost to a restart become uncertain
             return await super().connect(**kwargs)
+
+        def _build_card(self, public_url=None, agent=None) -> dict:
+            """The stock card plus one optional runtime protocol 2 extension; the stock a2a card never has it."""
+            card = super()._build_card(public_url, agent=agent)
+            capabilities = card["capabilities"]
+            card["capabilities"] = {**capabilities, "extensions": [*capabilities.get("extensions", []),
+                                                                   dict(RUNTIME_PROTOCOL_2_EXTENSION)]}
+            return card
 
         # ---- JSON-RPC methods (PoolRequestHandler) ----
         def _pool_capability(self, req_id, params):

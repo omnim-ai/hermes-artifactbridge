@@ -5,9 +5,11 @@ delivery, and the control client's status mapping against the server contract
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx2
 import pytest
@@ -184,6 +186,62 @@ def test_every_fixture_parses_through_the_plugins_own_parsers():
                    "capability-probe-required-response.json", "join-capability-probe-required-response.json",
                    "connection-changed-response.json", "manifest.json"}
     assert covered | listener | server_only == {f.name for f in fake_pool.FIXTURES.glob("*.json")}
+
+
+ROOM = "room_space_context_v1"
+PROTOCOL2 = Path(__file__).parent / "fixtures" / "runtime_protocol2"
+
+
+def _answer(params: dict, **kwargs) -> dict:
+    return pool_protocol.capability_answer(params, **{"executor_id": EXECUTOR_ID, "connection_revision": REVISION,
+                                                      "runtime_version": "r", **kwargs})
+
+
+def test_runtime_capability_protocol_2_answers_exactly_the_seven_and_protocol_1_stays_the_six():
+    v1 = fixture("cloud-capability-request.json")["body"]["params"]
+    six, seven = list(IMPLEMENTED_CAPABILITIES), [*IMPLEMENTED_CAPABILITIES, ROOM]
+    assert pool_protocol.PROTOCOL_VERSION == 1  # the assignment protocol is not the runtime capability protocol
+    assert pool_protocol.RUNTIME_PROTOCOL_CAPABILITIES == {1: tuple(six), 2: tuple(seven)}
+    v2 = {**v1, "protocolVersion": 2, "requiredCapabilities": seven[::-1]}
+    assert _answer(v2) == {"protocolVersion": 2, "executorId": EXECUTOR_ID, "executorConnectionRevision": REVISION,
+                           "nonce": v1["nonce"], "capabilities": seven, "runtimeVersion": "r"}
+    assert _answer({**v1, "requiredCapabilities": six[:1]}) == {**_answer(v1), "protocolVersion": 1, "capabilities": six}
+    for required in ([*six, ROOM], [ROOM]):  # protocol 1 never claims the room capability
+        with pytest.raises(Refused, match="capability_mismatch"):
+            _answer({**v1, "requiredCapabilities": required})
+    for change in ({"requiredCapabilities": six}, {"requiredCapabilities": seven[1:]},
+                   {"requiredCapabilities": [*seven, seven[0]]}, {"requiredCapabilities": [*seven[:-1], six[0]]},
+                   {"requiredCapabilities": [*seven, "same_session_continuation"]},
+                   {"requiredCapabilities": [*six, "same_session_continuation"]}, {"requiredCapabilities": []},
+                   {"requiredCapabilities": [*six, {"name": ROOM}]}, {"requiredCapabilities": tuple(seven)},
+                   {"protocolVersion": 3}, {"protocolVersion": 0}, {"protocolVersion": "2"}, {"protocolVersion": True},
+                   {"protocolVersion": 2.0}, {"protocolVersion": [2]}, {"executorId": uid(42)},
+                   {"executorConnectionRevision": "2"}, {"nonce": "N" * 31}, {"nonce": "N" * 129}):
+        with pytest.raises(Refused, match="capability_mismatch"):
+            _answer({**v2, **change})
+    for params in (_without(v2, "nonce"), {**v2, "extra": 1}, None, [v2]):
+        with pytest.raises(Refused, match="capability_mismatch"):
+            _answer(params)
+
+
+def test_runtime_protocol_2_fixtures_match_the_plugin_sets_answer_and_recorded_hashes():
+    server = json.loads((PROTOCOL2 / "plugin-fixtures.json").read_text())
+    for version, count in (("1", 6), ("2", 7)):
+        exact, ours = server["exactSets"]["cloud"][version], pool_protocol.RUNTIME_PROTOCOL_CAPABILITIES[int(version)]
+        assert set(exact) == set(ours) and len(exact) == len(set(exact)) == len(ours) == count
+    challenge = server["cloudV2Challenge"]
+    request = json.loads((PROTOCOL2 / "capability-v2-request.json").read_text())["body"]
+    assert request["method"] == pool_protocol.CAPABILITY_METHOD and request["params"] == {
+        "protocolVersion": 2, "executorId": challenge["executorId"],
+        "executorConnectionRevision": challenge["executorConnectionRevision"], "nonce": challenge["nonce"],
+        "requiredCapabilities": server["exactSets"]["cloud"]["2"]}
+    result = json.loads((PROTOCOL2 / "capability-v2-result.json").read_text())
+    answered = _answer(request["params"], executor_id=challenge["executorId"],
+                       connection_revision=challenge["executorConnectionRevision"], runtime_version="0.0.0-fixture")
+    assert result == {"jsonrpc": "2.0", "id": request["id"], "result": answered}
+    assert answered == {**server["cloudV2Answer"], "runtimeVersion": "0.0.0-fixture"}
+    recorded = dict(re.findall(r"^\| `([^`]+)` \| `([0-9a-f]{64})` \|$", (PROTOCOL2 / "SOURCE.md").read_text(), re.M))
+    assert recorded == {f.name: hashlib.sha256(f.read_bytes()).hexdigest() for f in PROTOCOL2.glob("*.json")}
 
 
 def _without(d: dict, key: str) -> dict:
