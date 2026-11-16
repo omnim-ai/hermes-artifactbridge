@@ -8,7 +8,7 @@ import logging
 import re
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx2
@@ -1021,3 +1021,38 @@ def test_a_dispatch_id_reused_by_another_assignment_is_refused_without_reading_i
     assert "first assignment" not in decision.text and decision.context_id == ""
     assert len(server.requests) == before and len(rows(journal_path)) == 1
     assert core.credentials.lookup(POOL_PLATFORM, decision.context_id, "task-2") is None
+
+
+# ---- the bound dlc_ near its expiry (the run's brief and tool reads look it up) ----
+
+EXPIRES = datetime(2026, 10, 17, 11, 15, tzinfo=timezone.utc)
+DLC, RENEWED = "dlc_" + "a" * 43, "dlc_" + "c" * 43
+
+
+def _bound(now: list, renew) -> CredentialBindings:
+    bound = CredentialBindings(now=lambda: now[0])
+    bound.bind(POOL_PLATFORM, CTX, "task-1", DLC, {"delegationId": uid(3)}, EXPIRES, renew)
+    return bound
+
+
+def test_a_credential_near_its_expiry_is_re_bootstrapped_once_before_use():
+    now, renewals = [EXPIRES - timedelta(minutes=14)], []
+
+    def renew():
+        renewals.append(now[0])
+        return RENEWED, now[0] + timedelta(minutes=15)
+
+    bound = _bound(now, renew)
+    assert bound.lookup(POOL_PLATFORM, CTX, "task-1") == DLC and renewals == []
+    now[0] = EXPIRES - timedelta(seconds=30)
+    assert [bound.lookup(POOL_PLATFORM, CTX, "task-1") for _ in range(2)] == [RENEWED, RENEWED]
+    assert renewals == [now[0]]
+
+
+@pytest.mark.parametrize("at, expected", [(EXPIRES - timedelta(seconds=30), DLC), (EXPIRES + timedelta(seconds=1), None)],
+                         ids=["still-valid", "expired"])
+def test_a_failed_re_bootstrap_keeps_a_valid_credential_and_never_returns_an_expired_one(at, expected):
+    def unavailable():
+        raise ControlUnavailable("down")
+
+    assert _bound([at], unavailable).lookup(POOL_PLATFORM, CTX, "task-1") == expected

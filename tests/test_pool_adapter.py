@@ -28,6 +28,7 @@ from hermes_artifactbridge.agent_run import AgentRuns  # noqa: E402
 from hermes_artifactbridge.pool_core import POOL_PLATFORM, CredentialBindings, PoolControl, PoolCore  # noqa: E402
 from hermes_artifactbridge.pool_journal import Journal  # noqa: E402
 from hermes_artifactbridge.pool_protocol import report_body  # noqa: E402
+from hermes_artifactbridge.schemas import TOOL_NAMES  # noqa: E402
 from tests import fake_ab, fake_omp_run, fake_pool  # noqa: E402
 from tests.conftest import FakeCtx  # noqa: E402
 from tests.fake_omp_run import UNIT, FakeOmpRun, completed  # noqa: E402
@@ -283,16 +284,13 @@ def test_a_changed_stock_build_card_refuses_pooled_registration(pool_env, monkey
     ctx, entries = FakeCtx(), []
     ctx.register_platform = lambda **entry: entries.append(entry)
     register(ctx)
-    assert entries == [] and [t for t in ctx.tools if t["toolset"] == "artifactbridge-pool"] == []
-    assert "outside the tested range" in caplog.text
+    assert entries == [] and "outside the tested range" in caplog.text
 
 
-def test_configured_registration_adds_a_separate_listener_and_pooled_tools(registered):
+def test_configured_registration_adds_a_separate_listener_and_no_extra_tools(registered):
     ctx, entries = registered
     assert [(e.name, e.platform_hint, e.allow_update_command) for e in entries] == [(POOL_PLATFORM, _PLATFORM_HINT, False)]
-    pooled = [t for t in ctx.tools if t["toolset"] == "artifactbridge-pool"]
-    assert len(pooled) == 11 and all(t["check_fn"]() for t in pooled)
-    assert len(ctx.tools) == 22 and entries[0].is_connected(None) is True
+    assert [t["name"] for t in ctx.tools] == list(TOOL_NAMES) and entries[0].is_connected(None) is True
 
 
 def test_factory_builds_on_the_pooled_platform_and_port_with_a_journal_under_hermes_home(registered, monkeypatch, tmp_path):
@@ -645,7 +643,8 @@ ROOM_MESSAGE = "This workspace has no runner credit left this month. Ask a works
 
 
 @pytest.mark.parametrize("start, text", [
-    ({"exit": 3, "answer": {"status": "credit_exhausted", "room_message": ROOM_MESSAGE}}, ROOM_MESSAGE),
+    ({"exit": 2, "answer": {"ok": False, "code": "runner_credential_refused", "status": "credit_exhausted",
+                            "room_message": ROOM_MESSAGE}}, ROOM_MESSAGE),
     ({"exit": 2, "answer": {"ok": False, "code": "draining", "detail": "the gateway is draining"}}, "draining"),
     (None, "omp_run_unavailable"),
 ], ids=["token-refusal", "start-refusal", "missing-binary"])

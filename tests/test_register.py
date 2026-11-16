@@ -8,10 +8,10 @@ import pytest
 
 import hermes_artifactbridge as plugin_module
 from hermes_artifactbridge import SKILL_PATH, register
-from hermes_artifactbridge.schemas import (POOL_TOOL_SCHEMAS, POOL_WIRE_NAMES, RESERVED_ARGS, TOKEN_ARG, TOOL_NAMES,
-                                           TOOL_SCHEMAS, TOOLSET)
+from hermes_artifactbridge.schemas import RESERVED_ARGS, TOKEN_ARG, TOOL_NAMES, TOOL_SCHEMAS, TOOLSET
 from tests import fake_ab
 from tests.conftest import FakeCtx
+from tests.fake_pool import EXECUTOR_ID, REVISION
 
 
 @pytest.mark.parametrize("tools_url", ["", " ", "not-a-url", "http://app.artifactbridge.com/mcp/agent-gateway",
@@ -173,17 +173,15 @@ def test_space_tools_use_the_contract_proxy_schemas():
 
 
 @pytest.mark.parametrize("name, args", [(READ_SPACE_CONTEXT, {}), (READ_SKILL, {"slug": "a"})])
-def test_space_role_is_an_optional_two_value_enum_on_the_legacy_and_pooled_space_tools(name, args):
-    legacy = next(s for s in TOOL_SCHEMAS if s["name"] == name)["parameters"]
-    pooled = next(p for p in POOL_TOOL_SCHEMAS if POOL_WIRE_NAMES[p["name"]] == name)["parameters"]
-    for params, base in ((legacy, {"delegation_token": "t", **args}), (pooled, args)):
-        role = params["properties"]["space_role"]
-        assert role["type"] == "string" and role["enum"] == ["agent", "room"] and "default" not in role
-        assert "space_role" not in params["required"] and "additionalProperties" not in params  # unchanged: absent
-        validate = Draft202012Validator(params).is_valid
-        assert validate(base) and validate({**base, "space_role": "agent"}) and validate({**base, "space_role": "room"})
-        assert not validate({**base, "space_role": "both"}) and not validate({**base, "space_role": None})
-    assert TOKEN_ARG not in pooled["properties"] and TOKEN_ARG not in pooled["required"]
+def test_space_role_is_an_optional_two_value_enum_on_the_space_tools(name, args):
+    params = next(s for s in TOOL_SCHEMAS if s["name"] == name)["parameters"]
+    base = {"delegation_token": "t", **args}
+    role = params["properties"]["space_role"]
+    assert role["type"] == "string" and role["enum"] == ["agent", "room"] and "default" not in role
+    assert "space_role" not in params["required"] and "additionalProperties" not in params  # unchanged: absent
+    validate = Draft202012Validator(params).is_valid
+    assert validate(base) and validate({**base, "space_role": "agent"}) and validate({**base, "space_role": "room"})
+    assert not validate({**base, "space_role": "both"}) and not validate({**base, "space_role": None})
 
 
 def test_schemas_are_static_require_token_and_restrict_authority_selectors():
@@ -315,3 +313,43 @@ async def test_registered_html_create_ambiguous_failure_is_not_retried(registere
     assert result == {"error": "scoped_call_failed"}
     assert ab.tool_calls == [(CREATE_DOCUMENT, args)]
     assert ab.renew_calls == 0
+
+
+# ---- pooled mode registration ----
+
+POOL_ENV = {"ARTIFACTBRIDGE_POOL_ENABLED": "1", "ARTIFACTBRIDGE_POOL_EXECUTOR_ID": EXECUTOR_ID,
+            "ARTIFACTBRIDGE_POOL_CONNECTION_REVISION": REVISION}
+
+
+def _registered(monkeypatch, env: dict) -> tuple[FakeCtx, list]:
+    for name in POOL_ENV:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("ARTIFACTBRIDGE_SERVICE_CREDENTIAL", fake_ab.SERVICE_CREDENTIAL)
+    ctx, platforms = FakeCtx(), []
+    ctx.register_platform = lambda **kw: platforms.append(kw)
+    register(ctx)
+    return ctx, platforms
+
+
+@pytest.mark.parametrize("env", [
+    {},
+    {**POOL_ENV, "ARTIFACTBRIDGE_POOL_ENABLED": "0"},
+    {**POOL_ENV, "ARTIFACTBRIDGE_POOL_EXECUTOR_ID": "not-a-uuid"},
+    {**POOL_ENV, "ARTIFACTBRIDGE_POOL_CONNECTION_REVISION": "01"},
+    {k: v for k, v in POOL_ENV.items() if k != "ARTIFACTBRIDGE_POOL_CONNECTION_REVISION"},
+], ids=["unset", "disabled", "bad-executor", "bad-revision", "partial"])
+def test_unconfigured_pooled_mode_registers_exactly_the_legacy_surface(monkeypatch, env):
+    baseline, _ = _registered(monkeypatch, {})
+    ctx, platforms = _registered(monkeypatch, env)
+    assert platforms == []
+    assert [(t["name"], t["toolset"]) for t in ctx.tools] == [(t["name"], t["toolset"]) for t in baseline.tools]
+    assert [t["name"] for t in ctx.tools] == [s["name"] for s in TOOL_SCHEMAS] and ctx.skills == baseline.skills
+
+
+def test_configured_pooled_mode_on_an_untested_hermes_registers_nothing_extra(monkeypatch, caplog):
+    monkeypatch.setattr(plugin_module.pool_adapter, "hermes_shape_supported", lambda: False)
+    ctx, platforms = _registered(monkeypatch, POOL_ENV)
+    assert platforms == [] and [t["name"] for t in ctx.tools] == [s["name"] for s in TOOL_SCHEMAS]
+    assert "outside the tested range" in caplog.text and "agx_" not in caplog.text

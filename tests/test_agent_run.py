@@ -20,6 +20,9 @@ DLC = "dlc_" + "d" * 43
 UNCONFIRMED = ("The task ended, but we couldn't confirm that its question was posted in the Room. The question is "
                "included below. Send the task again as a new request with your answer and the context it needs.")
 ROOM_MESSAGE = "This workspace has no runner credit left this month. Ask a workspace owner to add credit."
+# A structured question with no prompt/question string: sorted JSON, cut to the 20,000-code-point limit.
+STRUCTURED = {"options": ["é" * 25_000], "kind": "choice", "prompt": " "}
+STRUCTURED_TEXT = ('{"kind": "choice", "options": ["' + "\\u00e9" * 25_000)[:20_000]
 
 
 @pytest.fixture
@@ -63,13 +66,20 @@ def test_a_started_run_gets_exactly_the_twelve_key_owner_only_request_deleted_af
     (completed("The page is drafted."), Outcome(COMPLETED, "The page is drafted.")),
     ({**completed(), "outcome": "question", "question": " Which tone? ", "result_text": None},
      Outcome(FAILED, f"{UNCONFIRMED}\n\nWhich tone?", {"reason": "clarification_unsupported", "question": "Which tone?"})),
+    ({**completed(), "outcome": "question", "question": {"prompt": "Which tone?", "options": ["warm", "formal"]},
+      "result_text": None},
+     Outcome(FAILED, f"{UNCONFIRMED}\n\nWhich tone?", {"reason": "clarification_unsupported", "question": "Which tone?"})),
+    ({**completed(), "outcome": "question", "question": STRUCTURED, "result_text": None},
+     Outcome(FAILED, f"{UNCONFIRMED}\n\n{STRUCTURED_TEXT}",
+             {"reason": "clarification_unsupported", "question": STRUCTURED_TEXT})),
     ({**completed(), "outcome": "failed", "error_code": "outcome_too_long", "result_text": None},
      Outcome(FAILED, "outcome_too_long")),
     ({"unit": UNIT, "active": True, "timeout": True}, Outcome(FAILED, "timeout", timed_out=True)),
     ({"unit": UNIT, "active": False, "result": "unknown_unit"}, Outcome(FAILED, "unknown_unit")),
     ({"unit": UNIT, "active": False, "outcome": "result_unreadable"}, Outcome(FAILED, "result_unreadable")),
     ({**completed(), "result_text": ""}, Outcome(FAILED, "omp_run_wait_failed")),
-], ids=["completed", "question", "failed", "timeout", "unknown-unit", "unreadable", "empty-completed"])
+], ids=["completed", "question", "question-prompt", "question-json", "failed", "timeout", "unknown-unit", "unreadable",
+        "empty-completed"])
 def test_the_wait_line_maps_to_the_task_outcome(runs, omp, answer, outcome):
     omp.set(wait={"exit": 0 if answer.get("outcome") in ("completed", "question") else 1, "answer": answer})
     assert runs.wait(UNIT) == outcome
@@ -97,21 +107,18 @@ def test_already_running_without_a_unit_fails_rather_than_guessing_one(runs, omp
     assert runs.start(ENVELOPE, DLC) == Outcome(FAILED, "already_running")
 
 
-@pytest.mark.parametrize("exit_code, answer", [
-    (3, {"status": "credit_exhausted", "room_message": ROOM_MESSAGE}),
-    (2, {"ok": False, "code": "runner_credential_refused", "detail": "the runner credential service refused this run",
-         "unit": UNIT, "status": "credit_exhausted", "room_message": ROOM_MESSAGE}),
-], ids=["exit-3", "omp-run-refusal"])
-def test_a_token_service_refusal_fails_with_its_room_message_and_starts_nothing(runs, omp, delegation, exit_code,
-                                                                                answer):
-    omp.set(start={"exit": exit_code, "answer": answer})
-    assert runs.start(ENVELOPE, DLC) == Outcome(FAILED, ROOM_MESSAGE)
+REFUSAL = {"ok": False, "code": "runner_credential_refused", "detail": "the runner credential service refused this run",
+           "unit": UNIT, "status": "credit_exhausted"}
+
+
+@pytest.mark.parametrize("answer, text", [
+    ({**REFUSAL, "room_message": ROOM_MESSAGE}, ROOM_MESSAGE),
+    (REFUSAL, "runner_credential_refused"),
+], ids=["room-message", "no-room-message"])
+def test_a_token_service_refusal_fails_with_its_room_message_and_starts_nothing(runs, omp, delegation, answer, text):
+    omp.set(start={"exit": 2, "answer": answer})
+    assert runs.start(ENVELOPE, DLC) == Outcome(FAILED, text)  # never the refusal's unit
     assert [c["argv"][0] for c in omp.calls] == ["start"]
-
-
-def test_exit_3_without_a_room_message_is_a_plain_failure(runs, omp, delegation):
-    omp.set(start={"exit": 3, "answer": {"status": "credit_exhausted"}})
-    assert runs.start(ENVELOPE, DLC) == Outcome(FAILED, "omp_run_start_failed")
 
 
 def test_a_missing_binary_fails_closed(app, tmp_path, delegation, monkeypatch):

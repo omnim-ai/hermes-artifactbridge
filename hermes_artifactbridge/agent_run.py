@@ -19,7 +19,7 @@ import threading
 from dataclasses import dataclass
 
 from .mcp_client import HttpFactory, call_scoped_tool, default_http_factory, list_scoped_tools
-from .pool_core import CANCELED, COMPLETED, FAILED, clarification
+from .pool_core import CANCELED, COMPLETED, FAILED, QUESTION_MAX, clarification
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,19 @@ def request_body(envelope: dict, brief: dict, tools: list) -> dict:
             "conversation": None}
 
 
+def _question_text(question: object) -> str:
+    """A string question unchanged; a structured one (AI-6423) by its non-empty ``prompt`` or ``question`` string,
+    else as sorted JSON cut to the clarification limit; anything else is no question."""
+    if isinstance(question, str):
+        return question
+    if not isinstance(question, dict):
+        return ""
+    for key in ("prompt", "question"):
+        if isinstance(question.get(key), str) and question[key].strip():
+            return question[key]
+    return json.dumps(question, sort_keys=True)[:QUESTION_MAX]
+
+
 def wait_outcome(answer: dict) -> Outcome:
     """The task outcome of an ``omp-run wait`` line (spec §4.4): ``completed`` with its result_text; a
     ``question`` fails with cloudTerminal clarification_unsupported (decision D4); everything else fails with
@@ -76,8 +89,7 @@ def wait_outcome(answer: dict) -> Outcome:
     if outcome == "completed" and isinstance(answer.get("result_text"), str) and answer["result_text"]:
         return Outcome(COMPLETED, answer["result_text"])
     if outcome == "question":
-        question = answer.get("question")
-        text, terminal = clarification(question if isinstance(question, str) else "")
+        text, terminal = clarification(_question_text(answer.get("question")))
         return Outcome(FAILED, text, terminal)
     if outcome == "failed":
         return _failed(_code(answer.get("error_code"), "turn_failed"))
@@ -154,8 +166,8 @@ class AgentRuns:
         if isinstance(unit, str) and _UNIT_RE.match(unit):
             return unit
         message = answer.get("room_message")
-        # Exit 3 (or omp-run's runner_credential_refused): the token service refused; nothing was started.
-        if (done.returncode == 3 or answer.get("code") == "runner_credential_refused") and isinstance(message, str) \
+        # runner_credential_refused: the token service refused; nothing was started.
+        if done.returncode == 2 and answer.get("code") == "runner_credential_refused" and isinstance(message, str) \
                 and 1 <= len(message) <= ROOM_MESSAGE_MAX:
             logger.warning("artifactbridge agent run refused by the token service: %s",
                            _code(answer.get("status"), "unknown"))

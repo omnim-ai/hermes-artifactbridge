@@ -299,9 +299,10 @@ server's requests (see Start headers).
   `conversation` (null). The file is owner-only (0600), never logged, and
   deleted once `omp-run start --agent <serviceId> --request <file>` returns.
   An `already_running` refusal that names a unit reuses that unit; any other
-  refusal fails the task with its code. A runner-token refusal (exit 3, or
-  omp-run's `runner_credential_refused`) fails the task with the refusal's
-  `room_message` as its text and starts nothing. A thread then runs `omp-run
+  refusal fails the task with its code. A runner-token refusal (exit 2,
+  `runner_credential_refused`) fails the task with the refusal's
+  `room_message` as its text (with none, with the code) and starts nothing.
+  A thread then runs `omp-run
   wait --unit <unit>`: `completed` completes the task with its `result_text`;
   `question` fails it as a clarification (below); `failed`, an unknown unit or
   an unreadable result fails it with the error code; a wait timeout is
@@ -329,15 +330,6 @@ server's requests (see Start headers).
   exited 0. Otherwise it stays live
   with `metadata["artifactbridge.cancel"] = "pending"` and later records its
   real outcome. A finished task is `-32002 not cancelable`.
-- **Pooled tools.** Toolset `artifactbridge-pool` holds token-free
-  `artifactbridge_pool_*` variants of the eleven tools (same server tools on the
-  wire). They present only the current task's `dlc_` as `Authorization: Bearer`,
-  with no delegation-token header and no service credential. Without a binding
-  they return `pooled_credential_unavailable`. A `dlc_` within 60 s of its
-  `expiresAt` is re-bootstrapped before use, and a `credential_expired` denial
-  is re-bootstrapped and retried exactly once (one refresh per task at a time;
-  a refresh never starts a turn). Legacy tools refuse with
-  `pooled_session_requires_pooled_tools` inside a pooled session.
 - **Clarification.** A pooled runner cannot continue a conversation. When a
   run's outcome is `question`, the task ends
   `TASK_STATE_FAILED` with task metadata
@@ -349,7 +341,9 @@ server's requests (see Start headers).
   status text says the question's delivery is unconfirmed, quotes the question
   and asks the sender to send the task again as a new request with the answer.
   A question over 20,000 Unicode code points is never cut short: the task
-  fails with the generic `outcome_too_long` and no cloudTerminal. The result
+  fails with the generic `outcome_too_long` and no cloudTerminal. A structured
+  (object) question is its non-empty `prompt` or `question` string; without
+  one it is the object as sorted-key JSON, cut to 20,000 code points. The result
   and its cloudTerminal are journaled with the `stopped`/`failed` report in one
   transaction, before the in-memory task store; the first result wins, and
   Get, List and a repeated Send answer it, also after a restart. Only that
@@ -539,7 +533,7 @@ refusals as contract fixtures; they prove forwarding, header handling, renewal
 and exact result passthrough, not backend ACL or SQL behavior.
 Local checks used Python 3.14.7, mcp 2.2.0 and httpx2 2.13.1.
 
-Pooled-mode core tests (`tests/test_pool_core.py`, `tests/test_pool_tools.py`)
+Pooled-mode core tests (`tests/test_pool_core.py`, `tests/test_agent_run.py`)
 use a fake control server (`tests/fake_pool.py`) and run without Hermes. The
 adapter tests (`tests/test_pool_adapter.py`) skip unless Hermes' stock A2A
 adapter is importable; run them from a scratch venv on Hermes' Python whose
