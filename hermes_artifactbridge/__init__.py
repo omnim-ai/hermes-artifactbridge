@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 
 from . import pool_adapter
+from .agent_run import DEFAULT_OMP_RUN, AgentRuns
 from .endpoint import is_trusted_url
 from .pool_core import CREDENTIALS, POOL_PLATFORM, PoolControl, PoolCore
 from .pool_journal import Journal
@@ -27,6 +28,7 @@ POOL_ENABLED_ENV = "ARTIFACTBRIDGE_POOL_ENABLED"
 POOL_EXECUTOR_ID_ENV = "ARTIFACTBRIDGE_POOL_EXECUTOR_ID"
 POOL_REVISION_ENV = "ARTIFACTBRIDGE_POOL_CONNECTION_REVISION"
 POOL_PORT_ENV = "ARTIFACTBRIDGE_POOL_PORT"
+OMP_RUN_ENV = "ARTIFACTBRIDGE_OMP_RUN"  # the omp-run binary of pooled agent runs; default `omp-run` on PATH
 POOL_REQUIRED_ENV = (POOL_ENABLED_ENV, POOL_EXECUTOR_ID_ENV, POOL_REVISION_ENV)
 SERVICE_CREDENTIAL_ENV = "ARTIFACTBRIDGE_SERVICE_CREDENTIAL"
 TOOLS_URL_ENV = "ARTIFACTBRIDGE_TOOLS_URL"
@@ -114,7 +116,8 @@ def _pool_adapter_factory(config):
     core = PoolCore(journal=Journal(_journal_path()),
                     control=PoolControl(tools_url=_tools_url()),
                     executor_id=_pool_setting(POOL_EXECUTOR_ID_ENV), connection_revision=_pool_setting(POOL_REVISION_ENV))
-    return pool_adapter.build_adapter_class()(config, core=core, port=_pool_port(config))
+    runs = AgentRuns(tools_url=_tools_url(), binary=_pool_setting(OMP_RUN_ENV) or DEFAULT_OMP_RUN)
+    return pool_adapter.build_adapter_class()(config, core=core, port=_pool_port(config), runs=runs)
 
 
 def _register_pool(ctx) -> None:

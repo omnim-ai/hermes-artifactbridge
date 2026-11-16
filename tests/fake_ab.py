@@ -153,7 +153,7 @@ class FakeAB:
         elif method == "ping":
             result = {}
         elif method == "tools/list":
-            result = {"tools": [{"name": n, "inputSchema": {"type": "object"}} for n in TOOLS if n not in self.unoffered]}
+            result = {"tools": self.catalog()}
         elif method == "tools/call" and params.get("name") in self.unoffered:
             self.tool_calls.append((params["name"], params.get("arguments") or {}))
             return JSONResponse({"jsonrpc": "2.0", "id": rid,
@@ -163,6 +163,12 @@ class FakeAB:
         else:
             return JSONResponse({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "Method not found"}})
         return JSONResponse({"jsonrpc": "2.0", "id": rid, "result": result})
+
+    def catalog(self) -> list[dict]:
+        """The offered tools as AB lists them, with a key no MCP SDK model knows (it must survive pass-through)."""
+        return [{"name": n, "description": f"The {n} tool.", "inputSchema": {"type": "object"},
+                 "annotations": {"readOnlyHint": "read" in n}, "x-artifactbridge-answer-budget": {"chars": 40_000}}
+                for n in TOOLS if n not in self.unoffered]
 
     def _call(self, delegation: Delegation, name: str, args: dict) -> dict:
         self.tool_calls.append((name, args))
@@ -184,6 +190,17 @@ def _text(payload: dict, is_error: bool = False) -> dict:
 def _read_brief(ab: FakeAB, d: Delegation, args: dict) -> dict:
     return _text({"ok": True, "delegation_id": d.id, "room_id": d.room_id, "task": "Summarize the brief.",
                   "scope": d.scope()})
+
+
+def room_context(d: Delegation) -> dict:
+    """The brief object AB's container sends as the model's first message (delegation-boundary.ts fields)."""
+    return {"delegation_id": d.id, "room_id": d.room_id, "task": "Draft the landing page.",
+            "brief": "Use the Space tone.\n\u00e9\U0001F600", "scope": d.scope(), "completion": {"mode": "result"},
+            "room_space": {"id": "space-1", "skills": [{"slug": "tone", "version": None}]}}
+
+
+def _read_room_context(ab: FakeAB, d: Delegation, args: dict) -> dict:
+    return _text(room_context(d))
 
 
 def _read_room(ab: FakeAB, d: Delegation, args: dict) -> dict:
@@ -243,6 +260,7 @@ def _read_skill(ab: FakeAB, d: Delegation, args: dict) -> dict:
 
 
 TOOLS = {
+    "artifactbridge_read_room_context": _read_room_context,
     "artifactbridge_read_space_context": _read_space_context,
     "artifactbridge_read_skill": _read_skill,
     "artifactbridge_delegation_read_brief": _read_brief,
