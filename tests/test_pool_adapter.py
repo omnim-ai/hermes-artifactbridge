@@ -269,7 +269,7 @@ def settle(listener, task_id: str):
 
 def test_this_hermes_is_the_tested_shape_and_an_untested_version_is_refused(monkeypatch):
     assert pool_adapter.hermes_shape_supported() is True
-    monkeypatch.setattr("hermes_cli.plugins_manifest.running_hermes_version", lambda: "0.23.0")
+    monkeypatch.setattr("hermes_cli.plugins_manifest.running_hermes_version", lambda: "0.24.0")
     assert pool_adapter.hermes_shape_supported() is False
 
 

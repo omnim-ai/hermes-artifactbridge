@@ -261,7 +261,7 @@ server's requests (see Start headers).
   card has no marker. The override is `PoolAdapter._build_card(public_url,
   agent)`; that stock signature is part of the shape check, so a Hermes whose
   `_build_card` parameters differ does not register the pooled platform. The
-  tests check this against Hermes 0.22.2 only; they model the server's choice of
+  tests check this against Hermes 0.22.2 and 0.23.1; they model the server's choice of
   version from the card (labelled in `tests/test_pool_adapter.py`) and prove
   nothing about the server's resolver or SDK.
 - **Start headers.** Send, Get, List and Cancel must carry exactly one
@@ -434,12 +434,13 @@ Contract ambiguities, as implemented:
 
 **Not proven.** No pooled journey has run against a real ArtifactBridge server
 or a live Hermes gateway. The tests drive the listener's real socket with the
-generated fixture requests and the stock Hermes 0.22.2 A2A adapter
+generated fixture requests and the stock Hermes A2A adapter (0.22.2 and 0.23.1)
 in-process, against a fake control server, a fake MCP boundary and a fake
 `omp-run` executable (`tests/fake_omp_run.py`); no real `omp-run` or factory
 container has run a pooled task. The pooled platform refuses to register on any Hermes
-outside `>=0.22.2,<0.23` or with a different A2A adapter or handler shape.
-Only 0.22.2 has been exercised; a later 0.22 patch registers only if its
+outside `>=0.22.2,<0.24` or with a different A2A adapter or handler shape.
+The suite has run on 0.22.2 and 0.23.1 (the version on the AWS gateway host);
+another 0.22 or 0.23 patch registers only if its
 version and the checked member signatures match, and the shape check cannot
 catch a changed behavior behind an unchanged signature.
 
