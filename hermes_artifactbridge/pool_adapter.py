@@ -25,7 +25,7 @@ from .pool_protocol import (CAPABILITY_METHOD, METADATA_KEY, RUNTIME_PROTOCOL_2_
 
 logger = logging.getLogger(__name__)
 
-TESTED_HERMES = ">=0.22.2,<0.23"
+TESTED_HERMES = ">=0.22.2,<0.24"
 DEFAULT_PORT = 9901
 # A Send waits this long for omp-run to start the run; a run not yet started answers Submitted.
 _ADMISSION_WAIT = 5.0
